@@ -159,3 +159,6 @@ output/
 # ByteTrack 데모 미디어 (연구에 불필요, 원본 저장소에서 받을 수 있음)
 assets/*.gif
 videos/*.mp4
+
+# 설계·구현 문서 (로컬 및 OneDrive 백업에만 보관)
+docs/
