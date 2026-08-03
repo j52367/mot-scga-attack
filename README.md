@@ -72,7 +72,7 @@ conda activate mot
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 
 pip install opencv-python-headless motmetrics lap cython_bbox \
-            loguru thop pycocotools gdown tqdm
+            loguru thop tabulate pycocotools gdown kagglehub tqdm
 ```
 
 `cython_bbox` 빌드에는 컴파일러와 Python 헤더가 필요하다.
