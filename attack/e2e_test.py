@@ -47,10 +47,15 @@ def main():
     ap.add_argument('--generator', default='resnet')
     ap.add_argument('--gap', action='store_true')
     ap.add_argument('--nat', action='store_true')
+    ap.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     args = ap.parse_args()
 
-    device = torch.device('cpu')
-    print(f'입력 크기 {args.input_h}x{args.input_w} (CPU 테스트용 축소)\n')
+    device = torch.device(args.device)
+    print(f'장치 {device} | 입력 크기 {args.input_h}x{args.input_w}')
+    if device.type == 'cuda':
+        print(f'  {torch.cuda.get_device_name(0)}')
+        torch.cuda.reset_peak_memory_stats()
+    print()
 
     # ── 검출기 ───────────────────────────────────────────────────
     t0 = time.time()
@@ -72,7 +77,7 @@ def main():
     ds = MOT17PairDataset(data_root=args.data_root, split='train',
                           detector=args.detector_variant, half='first',
                           input_size=(args.input_h, args.input_w))
-    batch = pair_collate([ds[0]])
+    batch = {k: v.to(device) for k, v in pair_collate([ds[0]]).items()}
     img_t, img_u = batch['img_t'], batch['img_u']
     print(f'배치: img{tuple(img_t.shape)}  GT박스 {batch["boxes_t"].shape[0]}개\n')
 
@@ -137,6 +142,12 @@ def main():
     moved = (next(student.parameters()) - before).abs().sum().item()
     print(f'  step 후 파라미터 변화 {moved:.6f}')
     assert moved > 0
+
+    if device.type == 'cuda':
+        peak = torch.cuda.max_memory_allocated() / 1024**3
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f'\nVRAM 최대 사용 {peak:.2f} GB / {total:.0f} GB')
+        print(f'  배치 1 기준이므로, 여유를 보고 --batch_size 를 올릴 수 있다')
 
     print('\nend-to-end 경로 확인 완료')
 
