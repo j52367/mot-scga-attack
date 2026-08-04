@@ -129,6 +129,67 @@ def test_scga_utils():
     print(f"{OK} project: eps 상자 + [0,1] 모두 만족")
 
 
+# ── 5b. 섭동 파라미터화 ───────────────────────────────────────────
+def test_apply_perturbation():
+    from attack.losses import apply_perturbation
+    print("[5b] 섭동 파라미터화 — gradient 가 살아 있는가")
+
+    eps = 10 / 255.0
+    img = torch.rand(1, 3, 32, 32) * 0.6 + 0.2      # 경계 clamp 를 피해 중간값으로
+    # generator 출력을 흉내 낸다: tanh 라 [-1,1] 이고 대부분 포화되어 있다
+    raw = torch.tanh(torch.randn(1, 3, 32, 32) * 5).requires_grad_(True)
+
+    dead = {}
+    for mode in ('image', 'additive'):
+        r = raw.detach().clone().requires_grad_(True)
+        out = apply_perturbation(r, img, eps, mode)
+        dev = (out - img).abs().max().item()
+        assert dev <= eps + 1e-6, f'{mode}: eps 예산 초과'
+        assert out.min() >= 0 and out.max() <= 1
+
+        out.sum().backward()
+        dead[mode] = (r.grad.abs() == 0).float().mean().item()
+
+    print(f"       gradient 가 0 인 픽셀 비율   "
+          f"image={dead['image']*100:.1f}%   additive={dead['additive']*100:.1f}%")
+    assert dead['image'] > 0.5, "image 방식은 대부분 잘려 gradient 가 죽어야 한다"
+    assert dead['additive'] < 0.01, "additive 방식은 거의 모든 픽셀에 gradient 가 흘러야 한다"
+    print(f"{OK} image 는 클리핑으로 gradient 가 죽고, additive 는 살아 있다")
+    print(f"{OK} 두 방식 모두 eps 예산과 [0,1] 을 지킨다")
+
+
+# ── 5c. L_iou ────────────────────────────────────────────────────
+def test_temporal_iou():
+    from attack.losses import temporal_iou_loss
+    print("[5c] L_iou — 같은 객체의 프레임 간 박스 겹침")
+
+    ids = torch.tensor([7, 9])
+    b_t = torch.tensor([[0., 100, 100, 200, 300],
+                        [0., 500, 150, 600, 400]])
+    # 거의 안 움직인 경우 -> IoU 높음
+    near = b_t.clone(); near[:, 1:] += 5
+    # 크게 벗어난 경우 -> IoU 낮음
+    far = b_t.clone(); far[:, 1:] += 300
+
+    l_near = temporal_iou_loss(b_t, near, ids, ids).item()
+    l_far = temporal_iou_loss(b_t, far, ids, ids).item()
+    print(f"       거의 정지={l_near:.3f}  /  크게 이탈={l_far:.3f}")
+    assert l_near > 0.8, "인접 프레임 클린 IoU 는 0.8 이상이어야 한다"
+    assert l_far < 0.5, "2차 매칭 임계값 0.5 아래로 내려가야 공격이 성립한다"
+    print(f"{OK} 박스가 벌어질수록 낮아진다 (최소화 방향이 맞다)")
+
+    # 박스 좌표에 gradient 가 흐르는가
+    b = b_t.clone().requires_grad_(True)
+    temporal_iou_loss(b, near, ids, ids).backward()
+    assert b.grad is not None and b.grad.abs().sum() > 0
+    print(f"{OK} 박스 좌표에 gradient 도달 (검출기까지 이어진다)")
+
+    # ID 가 하나도 안 겹치면 0 을 돌려주고 죽지 않아야 한다
+    z = temporal_iou_loss(b_t, near, torch.tensor([1, 2]), torch.tensor([3, 4]))
+    assert z.item() == 0.0
+    print(f"{OK} 공통 ID 없음 -> 0 (에러 없이)")
+
+
 # ── 6. assign_ids — 예측-GT 매칭 ──────────────────────────────────
 def test_assign_ids():
     from attack.train_generator import assign_ids
@@ -199,6 +260,7 @@ def test_assign_ids_edge():
 if __name__ == '__main__':
     for fn in (test_descriptor_shape, test_gradient_flow, test_losses,
                test_loss_direction, test_scga_utils,
+               test_apply_perturbation, test_temporal_iou,
                test_assign_ids, test_assign_ids_edge):
         fn()
         print()

@@ -24,7 +24,8 @@ from generator.resnet import weights_init_normal
 from attack.dataset import MOT17PairDataset, pair_collate
 from attack.descriptor import object_descriptor  # noqa: F401  (frame_descriptor 내부에서 사용)
 from attack.generator_wrap import GeneratorWithFeatures
-from attack.losses import attack_loss, generator_consistency_loss, update_ema, project
+from attack.losses import (attack_loss, apply_perturbation, temporal_iou_loss,
+                           generator_consistency_loss, update_ema)
 from attack.train_generator import build_detector, frame_descriptor
 
 
@@ -44,6 +45,9 @@ def main():
     ap.add_argument('--roi_source', default='pred', choices=['pred', 'gt'])
     ap.add_argument('--no_center', action='store_true')
     ap.add_argument('--eps', type=float, default=10)
+    ap.add_argument('--delta_param', default='additive',
+                    choices=['additive', 'image'])
+    ap.add_argument('--w_iou', type=float, default=1.0)
     ap.add_argument('--generator', default='resnet')
     ap.add_argument('--gap', action='store_true')
     ap.add_argument('--nat', action='store_true')
@@ -96,16 +100,21 @@ def main():
     print(f'  블록 feature {len(ft_t)}개: ' +
           ', '.join(f'{tuple(f.shape[1:])}' for f in ft_t))
 
-    adv_t = project(adv_t, img_t, eps)
-    adv_u = project(adv_u, img_u, eps)
-    print(f'  eps 투영 후 최대 편차 {(adv_t-img_t).abs().max():.4f}  (eps={eps:.4f})\n')
+    adv_t = apply_perturbation(adv_t, img_t, eps, args.delta_param)
+    adv_u = apply_perturbation(adv_u, img_u, eps, args.delta_param)
+    d = (adv_t - img_t)
+    print(f'  eps 적용 후 최대 편차 {d.abs().max():.4f}  (eps={eps:.4f})')
+    print(f'  포화 비율 {(d.abs() >= 0.99*eps).float().mean()*100:.1f}% '
+          f'(image 방식이면 여기서 gradient 가 죽는다)\n')
 
     gen_sim = (generator_consistency_loss(ft_t, fs_t)
                + generator_consistency_loss(ft_u, fs_u))
 
     t0 = time.time()
-    d_t, ids_t = frame_descriptor(detector, adv_t, batch['boxes_t'], batch['ids_t'], args)
-    d_u, ids_u = frame_descriptor(detector, adv_u, batch['boxes_u'], batch['ids_u'], args)
+    d_t, ids_t, box_t = frame_descriptor(detector, adv_t, batch['boxes_t'],
+                                         batch['ids_t'], args)
+    d_u, ids_u, box_u = frame_descriptor(detector, adv_u, batch['boxes_u'],
+                                         batch['ids_u'], args)
     print(f'검출기 forward + 서술자 {time.time()-t0:.1f}초')
     print(f'  서술자 d_t{tuple(d_t.shape)}  매칭 ID {len(ids_t)}개')
     print(f'  서술자 d_u{tuple(d_u.shape)}  매칭 ID {len(ids_u)}개')
@@ -121,6 +130,12 @@ def main():
     loss = l_att + 0.7 * gen_sim
     print(f'손실  attack={l_att.item():+.4f}  (decorr={parts["decorr"]:+.4f}, '
           f'confuse={parts["confuse"]:+.4f})')
+
+    l_iou = temporal_iou_loss(box_t, box_u, ids_t, ids_u)
+    print(f'      iou={l_iou.item():.4f}  '
+          f'<- 같은 객체의 프레임 간 박스 IoU (클린은 0.8~0.9)')
+    if args.w_iou > 0:
+        loss = loss + args.w_iou * l_iou
     print(f'      gen_sim={gen_sim.item():.4f}   total={loss.item():+.4f}\n')
 
     t0 = time.time()

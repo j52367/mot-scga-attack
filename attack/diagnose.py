@@ -48,7 +48,7 @@ from yolox.utils import postprocess
 from attack.dataset import (MOT17PairDataset, letterbox, normalize_for_detector,
                             pair_collate, read_seq_length)
 from attack.evaluate import load_attacker
-from attack.losses import center_pair, project, _pair_by_id
+from attack.losses import apply_perturbation, center_pair, _pair_by_id
 from attack.train_generator import build_detector, frame_descriptor
 
 
@@ -313,8 +313,8 @@ def run_descriptor_check(args, model, attacker, device):
         bt, bu = batch['boxes_t'].to(device), batch['boxes_u'].to(device)
         it, iu = batch['ids_t'].to(device), batch['ids_u'].to(device)
 
-        adv_t = project(_g(attacker, img_t), img_t, eps)
-        adv_u = project(_g(attacker, img_u), img_u, eps)
+        adv_t = apply_perturbation(_g(attacker, img_t), img_t, eps, args.delta_param)
+        adv_u = apply_perturbation(_g(attacker, img_u), img_u, eps, args.delta_param)
 
         lk = perturbation_locking(adv_t - img_t, adv_u - img_u, bt, bu, it, iu,
                                   min_disp=args.min_disp)
@@ -323,8 +323,8 @@ def run_descriptor_check(args, model, attacker, device):
 
         for mode, (xt, xu) in (('clean', (img_t, img_u)),
                                ('attack', (adv_t, adv_u))):
-            d_t, ids_t = frame_descriptor(model, xt, bt, it, args)
-            d_u, ids_u = frame_descriptor(model, xu, bu, iu, args)
+            d_t, ids_t, _ = frame_descriptor(model, xt, bt, it, args)
+            d_u, ids_u, _ = frame_descriptor(model, xu, bu, iu, args)
             same, diff = descriptor_cosines(d_t, d_u, ids_t, ids_u,
                                             center=not args.no_center)
             if same is not None:
@@ -398,7 +398,7 @@ def run_frames(args, model, attacker, device, dump_dir):
         img, r = letterbox(img_bgr, (args.input_h, args.input_w))
         x = torch.from_numpy(img).unsqueeze(0).to(device)
 
-        adv = project(_g(attacker, x), x, eps)
+        adv = apply_perturbation(_g(attacker, x), x, eps, args.delta_param)
         ns.add(adv - x, eps, valid_hw=(int(ih * r), int(iw * r)))
 
         for xx, st in ((x, det_clean), (adv, det_adv)):
@@ -530,6 +530,9 @@ def main():
     # 공격 (학습 때와 같은 값을 줘야 한다)
     ap.add_argument('--attack_ckpt', required=True)
     ap.add_argument('--eps', type=float, default=10)
+    ap.add_argument('--delta_param', default='additive',
+                    choices=['additive', 'image'],
+                    help='★ 학습 때 쓴 값과 반드시 같아야 한다')
     ap.add_argument('--generator', default='resnet')
     ap.add_argument('--gap', action='store_true')
     ap.add_argument('--nat', action='store_true')

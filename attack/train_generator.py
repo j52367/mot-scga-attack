@@ -27,8 +27,8 @@ from attack.dataset import (MOT17PairDataset, pair_collate,
                             normalize_for_detector)
 from attack.descriptor import object_descriptor
 from attack.generator_wrap import GeneratorWithFeatures
-from attack.losses import (attack_loss, generator_consistency_loss,
-                           update_ema, project)
+from attack.losses import (attack_loss, apply_perturbation, temporal_iou_loss,
+                           generator_consistency_loss, update_ema)
 
 warnings.filterwarnings("ignore")
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -72,6 +72,16 @@ def get_parser():
                    help='예측-GT 매칭 최소 IoU. 검출 품질 판정이 아니라 매칭 유지가 목적이라 낮게 둔다')
     p.add_argument('--roi_source', type=str, default='pred', choices=['pred', 'gt'],
                    help='ROI 영역을 예측 박스로 잡을지 GT 로 잡을지 (ablation)')
+    p.add_argument('--delta_param', type=str, default='additive',
+                   choices=['additive', 'image'],
+                   help="섭동 파라미터화. 'image' 는 SCGA 원본(생성기가 이미지를 내고 "
+                        "eps 로 자름) 이지만 Exp-001 에서 픽셀의 98%%가 잘려 "
+                        "gradient 가 죽었다. 'additive' 는 생성기 출력을 섭동으로 "
+                        "직접 해석한다 (attack/losses.py apply_perturbation 참고)")
+    p.add_argument('--w_iou', type=float, default=0.0,
+                   help='L_iou 가중치. 같은 객체의 프레임 간 박스 겹침을 줄인다. '
+                        'ByteTrack 처럼 외형을 쓰지 않는 트래커를 겨냥하려면 필요하다. '
+                        '0 이면 끈다')
     p.add_argument('--no_center', action='store_true',
                    help='서술자 중심화를 끈다. 켜두는 것이 기본이며, 끄면 다른 객체 간 '
                         '코사인이 +0.8 로 포화해 L_confuse 가 거의 학습을 이끌지 못한다')
@@ -262,8 +272,9 @@ def frame_descriptor(model, x01, boxes_gt, ids_gt, args):
         어느 쪽이든 기하 성분은 항상 예측 박스에서 오므로 gradient 는 유지된다.
 
     Returns:
-        d   : [M, C+4]   매칭 실패 시 [0, C+4]
-        ids : [M]
+        d      : [M, C+4]   매칭 실패 시 [0, C+4]
+        ids    : [M]
+        m_pred : [M, 5] (batch_idx, xyxy) 매칭된 예측 박스. L_iou 가 쓴다.
     """
     H, W = x01.shape[-2:]
 
@@ -274,7 +285,8 @@ def frame_descriptor(model, x01, boxes_gt, ids_gt, args):
     m_pred, m_gt, m_ids = assign_ids(pred_boxes, boxes_gt, ids_gt,
                                      iou_thr=args.iou_thr)
     if m_ids.numel() == 0:
-        return (torch.zeros(0, feat.shape[1] + 4, device=x01.device), m_ids)
+        return (torch.zeros(0, feat.shape[1] + 4, device=x01.device),
+                m_ids, m_pred)
 
     if args.roi_source == 'gt':
         # ROI 는 GT 로 뽑고, 기하 성분만 예측 박스에서 가져온다
@@ -288,7 +300,7 @@ def frame_descriptor(model, x01, boxes_gt, ids_gt, args):
     else:
         d = object_descriptor(feat, m_pred, (H, W), alpha=args.alpha)
 
-    return d, m_ids
+    return d, m_ids, m_pred
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -363,21 +375,21 @@ def main():
             adv_t, fs_t = student(img_t, feat=True)
             adv_u, fs_u = student(img_u, feat=True)
 
-            # 3) eps 투영
-            adv_t = project(adv_t, img_t, eps)
-            adv_u = project(adv_u, img_u, eps)
+            # 3) eps 예산 적용
+            adv_t = apply_perturbation(adv_t, img_t, eps, args.delta_param)
+            adv_u = apply_perturbation(adv_u, img_u, eps, args.delta_param)
 
             # 4) SCGA 일관성 손실
             gen_sim = (generator_consistency_loss(ft_t, fs_t)
                        + generator_consistency_loss(ft_u, fs_u))
 
             # 5) 공격 손실
-            d_t, ids_t = frame_descriptor(detector, adv_t,
-                                          batch['boxes_t'].to(device),
-                                          batch['ids_t'].to(device), args)
-            d_u, ids_u = frame_descriptor(detector, adv_u,
-                                          batch['boxes_u'].to(device),
-                                          batch['ids_u'].to(device), args)
+            d_t, ids_t, box_t = frame_descriptor(detector, adv_t,
+                                                 batch['boxes_t'].to(device),
+                                                 batch['ids_t'].to(device), args)
+            d_u, ids_u, box_u = frame_descriptor(detector, adv_u,
+                                                 batch['boxes_u'].to(device),
+                                                 batch['ids_u'].to(device), args)
 
             # 두 프레임에 공통 ID 가 없으면 공격 손실을 계산할 수 없다.
             # (데이터셋에서 공통 ID 2개 이상인 쌍만 뽑았으므로 드물지만,
@@ -392,15 +404,23 @@ def main():
 
             # 6) 합산 + 갱신
             loss = l_att + args.w_consistency * gen_sim
+            if args.w_iou > 0:
+                l_iou = temporal_iou_loss(box_t, box_u, ids_t, ids_u)
+                loss = loss + args.w_iou * l_iou
+                parts['iou'] = l_iou.item()
+
             loss.backward()
             optimG.step()
             update_ema(student, teacher, momentum=args.ema_momentum)
 
-            pbar.set_postfix(loss=f'{loss.item():.3f}',
-                             dec=f'{parts["decorr"]:.3f}',
-                             con=f'{parts["confuse"]:.3f}',
-                             gen=f'{gen_sim.item():.3f}',
-                             skip=n_skip)
+            post = dict(loss=f'{loss.item():.3f}',
+                        dec=f'{parts["decorr"]:.3f}',
+                        con=f'{parts["confuse"]:.3f}',
+                        gen=f'{gen_sim.item():.3f}',
+                        skip=n_skip)
+            if 'iou' in parts:
+                post['iou'] = f'{parts["iou"]:.3f}'
+            pbar.set_postfix(**post)
 
             # 7) 저장 (SCGA 는 student 가 아니라 teacher 를 저장한다)
             if it > 0 and it % args.save_freq == 0:

@@ -152,6 +152,8 @@ PYTHONPATH=. python attack/train_generator.py \
 | 인자 | 기본 | 설명 |
 |---|---|---|
 | `--eps` | 10 | L-inf 예산 (x/255) |
+| **`--delta_param`** | **additive** | 섭동 파라미터화. 아래 참고 |
+| **`--w_iou`** | **0.0** | `L_iou` 가중치. 0 이면 끈다 |
 | `--alpha` | 1.0 | 서술자의 기하 성분 가중치 |
 | `--lam` | 1.0 | `L_confuse` 가중치 |
 | `--fpn_level` | 1 | 백본 레벨 (0=stride8, 1=stride16, 2=stride32) |
@@ -162,6 +164,40 @@ PYTHONPATH=. python attack/train_generator.py \
 
 결과는 `experiments/<시각>_<method>_<generator>/` 에 저장된다.
 저장되는 것은 student가 아니라 **teacher(EMA)** 이다.
+
+### 섭동 파라미터화 (`--delta_param`)
+
+SCGA/BIA 원본(`image`)은 generator 가 `tanh` 로 **이미지 한 장**을 내고 그것을 eps 상자로 자른다.
+eps 공 안에 들어가려면 generator 가 먼저 항등 사상(입력 복원)을 배워야 하는데,
+ImageNet 128만장 x 10에폭이면 배우지만 MOT17 2천 스텝으로는 못 배운다.
+
+Exp-001 실측: **픽셀의 98%가 eps 경계에서 잘렸다.** `clamp` 는 잘린 곳에 gradient 를
+정확히 0 으로 흘리므로 **2%만 학습에 참여**했다. 노이즈 맵에 입력 장면이 그대로
+비쳐 보이는 것도 같은 이유다 — generator 가 공격이 아니라 입력 복원 중이었다.
+
+```
+image      adv = clamp(G(x), x-eps, x+eps)      gradient 죽은 픽셀 98.7%
+additive   adv = clamp(x + eps*G(x), 0, 1)      gradient 죽은 픽셀  0.0%
+```
+
+`G` 출력이 이미 `tanh` 라 `[-1,1]` 이므로 `eps` 를 곱하면 정확히 예산 안에 들어간다.
+두 방식 모두 남겨 ablation 으로 쓴다. 수치는 `attack/smoke_test.py [5b]` 에서 재현된다.
+
+**평가·진단에도 학습 때와 같은 값을 줘야 한다.** 다르면 공격이 성립하지 않는다.
+
+### `L_iou` (`--w_iou`)
+
+서술자 132차원 중 128차원이 외형인데, **ByteTrack 은 외형을 전혀 쓰지 않는다.**
+(BYTE 1차 cost = `1 - IoU*score`, 2차 cost = `1 - IoU`)
+외형 공격이 완벽히 성공해도 ByteTrack 의 IDF1 은 움직이지 않는다.
+
+```
+L_iou = mean_k IoU( b_t[k], b_{t+1}[k] )     # 같은 객체의 박스를 프레임 간에 벌린다
+```
+
+박스는 모든 트래커가 쓰므로 패러다임 중립성은 유지된다.
+목표 수준: 2차 매칭 탈락은 `IoU < 0.5`, 1차 매칭 탈락은 `IoU * score < 0.1`.
+인접 프레임 같은 사람의 클린 IoU 는 보통 0.8~0.9 다.
 
 ---
 

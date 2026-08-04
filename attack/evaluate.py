@@ -37,7 +37,7 @@ from yolox.utils import postprocess
 
 from attack.dataset import letterbox, normalize_for_detector, read_seq_length
 from attack.generator_wrap import GeneratorWithFeatures
-from attack.losses import project
+from attack.losses import apply_perturbation
 from attack.train_generator import build_detector
 from generator import build_generator
 
@@ -96,7 +96,8 @@ def run_sequence(seq_dir, model, attacker, args, device):
             adv = attacker(x)
             if isinstance(adv, tuple):
                 adv = adv[0]
-            x = project(adv, x, eps)
+            # 학습 때와 같은 파라미터화를 써야 한다. 다르면 공격이 성립하지 않는다.
+            x = apply_perturbation(adv, x, eps, args.delta_param)
 
         # ── 검출 ─────────────────────────────────────────────
         out = model(normalize_for_detector(x))
@@ -141,6 +142,9 @@ def main():
     # 공격
     ap.add_argument('--attack_ckpt', default=None, help='없으면 클린 평가')
     ap.add_argument('--eps', type=float, default=10)
+    ap.add_argument('--delta_param', default='additive',
+                    choices=['additive', 'image'],
+                    help='★ 학습 때 쓴 값과 반드시 같아야 한다')
     ap.add_argument('--generator', default='resnet')
     ap.add_argument('--gap', action='store_true')
     ap.add_argument('--nat', action='store_true')

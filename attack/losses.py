@@ -146,3 +146,80 @@ def update_ema(student, teacher, momentum=0.999):
 def project(adv, img, eps):
     """L-infinity eps 상자 + [0, 1] 범위로 투영."""
     return torch.clamp(torch.min(torch.max(adv, img - eps), img + eps), 0.0, 1.0)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  섭동 파라미터화
+# ══════════════════════════════════════════════════════════════════
+
+def apply_perturbation(raw, img, eps, mode='additive'):
+    """
+    generator 출력 raw 를 적대 이미지로 만든다.
+
+    'image' — SCGA/BIA 원본 방식.
+        generator 가 tanh 로 [-1,1] '이미지 한 장'을 내고, 그것을 eps 상자로 자른다.
+        eps 공 안에 들어가려면 generator 가 먼저 항등 사상(입력 복원)을 배워야 한다.
+        ImageNet 128만장 x 10에폭이면 배우지만, MOT17 2천 스텝으로는 못 배운다.
+
+        ★ 실측 (Exp-001 진단): 픽셀의 98.0% 가 eps 경계에 붙어 잘렸다.
+          clamp/min/max 는 잘린 곳에 gradient 를 정확히 0 으로 흘리므로
+          **픽셀의 2% 만 학습에 참여**했다. 노이즈 맵에 입력 장면이 그대로
+          보이는 것도 같은 이유다 — 생성기가 공격이 아니라 입력 복원 중이었다.
+
+    'additive' — 본 연구 기본값.
+        generator 출력을 '섭동 자체'로 해석한다. tanh 라 이미 [-1,1] 이므로
+        eps 를 곱하면 정확히 L-inf 예산 안에 들어간다.
+        클리핑이 없으니 모든 픽셀에 gradient 가 흐른다.
+        (경계 [0,1] clamp 는 남지만 실제로 걸리는 픽셀은 소수다)
+
+    두 방식을 플래그로 남겨 ablation 으로 쓴다 (DESIGN.md A8).
+    """
+    if mode == 'additive':
+        return torch.clamp(img + eps * raw, 0.0, 1.0)
+    if mode == 'image':
+        return project(raw, img, eps)
+    raise ValueError(f'알 수 없는 delta_param: {mode}')
+
+
+# ══════════════════════════════════════════════════════════════════
+#  기하 손실 — IoU 기반 연관을 직접 겨냥
+# ══════════════════════════════════════════════════════════════════
+
+def _diag_iou(a, b, eps=1e-7):
+    """짝지어진 박스끼리의 IoU. a, b : [M,4] xyxy. 미분 가능."""
+    x1 = torch.max(a[:, 0], b[:, 0])
+    y1 = torch.max(a[:, 1], b[:, 1])
+    x2 = torch.min(a[:, 2], b[:, 2])
+    y2 = torch.min(a[:, 3], b[:, 3])
+    inter = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
+    area_a = (a[:, 2] - a[:, 0]).clamp(min=0) * (a[:, 3] - a[:, 1]).clamp(min=0)
+    area_b = (b[:, 2] - b[:, 0]).clamp(min=0) * (b[:, 3] - b[:, 1]).clamp(min=0)
+    return inter / (area_a + area_b - inter + eps)
+
+
+def temporal_iou_loss(boxes_t, boxes_t1, ids_t, ids_t1):
+    """
+    L_iou — 같은 객체의 프레임 간 박스 겹침을 줄인다.
+
+    왜 필요한가:
+        서술자의 132차원 중 128차원이 외형인데, ByteTrack 은 외형을 전혀 쓰지 않는다.
+        (BYTE 1차 cost = 1 - IoU*score, 2차 cost = 1 - IoU)
+        외형 공격이 완벽히 성공해도 ByteTrack 의 IDF1 은 움직이지 않는다.
+        박스는 모든 트래커가 쓰므로 패러다임 중립성도 유지된다.
+
+    목표 수준 (evaluate.py 의 track_thresh 0.6 / match_thresh 0.9 기준):
+        1차 매칭 탈락  IoU * score < 0.1
+        2차 매칭 탈락  IoU < 0.5
+        인접 프레임 같은 사람의 클린 IoU 는 보통 0.8~0.9 다.
+
+    Args:
+        boxes_t, boxes_t1 : [M,5] (batch_idx, x1, y1, x2, y2) — 미분 가능
+        ids_t, ids_t1     : [M]
+
+    Returns:
+        스칼라 (같은 객체의 평균 IoU). 낮을수록 공격 성공.
+    """
+    i_t, i_t1 = _pair_by_id(ids_t, ids_t1)
+    if i_t is None:
+        return boxes_t.sum() * 0.0
+    return _diag_iou(boxes_t[i_t][:, 1:], boxes_t1[i_t1][:, 1:]).mean()
