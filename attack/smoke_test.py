@@ -215,17 +215,33 @@ def test_detection_keep():
     assert l_bad.item() > l_same.item()
     print(f"{OK} 검출이 유지되면 0, 흐트러지면 벌점")
 
-    # 점수가 '올라가도' 벌점이어야 오탐 홍수를 막는다 (Exp-003)
-    up = detection_keep_loss(s_clean + 0.3, s_clean, gt.clone(), gt)[0]
-    down = detection_keep_loss((s_clean - 0.3).clamp(min=0), s_clean,
-                               gt.clone(), gt)[0]
-    print(f"       점수 상승={up.item():.4f}  하락={down.item():.4f}")
-    assert up.item() > 0.2 and down.item() > 0.1
-    print(f"{OK} 점수는 양방향 벌점 — 억제와 오탐 홍수를 모두 막는다")
+    # 보이는 검출(s > tau)은 양방향 벌점이어야 한다
+    tau = 0.1
+    hi = s_clean > tau
+    s_up = s_clean.clone(); s_up[hi] += 0.3
+    s_dn = s_clean.clone(); s_dn[hi] = (s_dn[hi] - 0.3).clamp(min=0)
+    up = detection_keep_loss(s_up, s_clean, gt.clone(), gt, tau)[1]['dscore']
+    dn = detection_keep_loss(s_dn, s_clean, gt.clone(), gt, tau)[1]['dscore']
+    print(f"       보이는 검출  상승={up:.4f}  하락={dn:.4f}")
+    assert up > 0.2 and dn > 0.1
+    print(f"{OK} 보이는 검출은 양방향 — 억제도 증폭도 막는다")
+
+    # 배경(s <= tau)은 '올라갈 때만' 벌점이어야 한다.
+    # 전부 양방향으로 묶으면 백본이 통째로 고정돼 공격이 불가능해진다 (Exp-004)
+    lo = ~hi
+    bg_up = s_clean.clone(); bg_up[lo] = 0.9          # 배경이 치솟음 (오탐 홍수)
+    bg_dn = s_clean.clone(); bg_dn[lo] = 0.0          # 배경이 더 내려감 (무해)
+    p_up = detection_keep_loss(bg_up, s_clean, gt.clone(), gt, tau)[1]
+    p_dn = detection_keep_loss(bg_dn, s_clean, gt.clone(), gt, tau)[1]
+    print(f"       배경 상승 bgup={p_up['bgup']:.4f}  "
+          f"배경 하락 bgup={p_dn['bgup']:.4f}")
+    assert p_up['bgup'] > 0.5, "배경이 tau 를 넘으면 벌점 (Exp-003 오탐 홍수 차단)"
+    assert p_dn['bgup'] == 0.0, "배경이 내려가는 것은 트래커가 못 보므로 무벌점"
+    print(f"{OK} 배경은 단방향 — 홍수는 막고 자유도는 남긴다")
 
     # 매칭이 하나도 없어도 죽지 않아야 한다
     empty = torch.zeros(0, 5)
-    l0, p0 = detection_keep_loss(s_clean.clone(), s_clean, empty, empty)
+    l0, _ = detection_keep_loss(s_clean.clone(), s_clean, empty, empty, tau)
     assert l0.item() < 1e-6
     print(f"{OK} 매칭 없음 -> 점수 항만 (에러 없이)")
 

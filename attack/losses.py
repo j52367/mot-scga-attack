@@ -197,7 +197,7 @@ def _diag_iou(a, b, eps=1e-7):
     return inter / (area_a + area_b - inter + eps)
 
 
-def detection_keep_loss(scores_adv, scores_clean, boxes_adv, boxes_gt):
+def detection_keep_loss(scores_adv, scores_clean, boxes_adv, boxes_gt, tau=0.1):
     """
     L_keep — 검출을 클린 상태로 붙잡아 둔다.
 
@@ -216,10 +216,25 @@ def detection_keep_loss(scores_adv, scores_clean, boxes_adv, boxes_gt):
 
         w_iou 를 꺼도 같은 일이 났으므로 원인은 손실 항이 아니라 **분리 장치의 부재**다.
 
-    두 항의 역할:
-        점수 항 — 클린보다 높아져도 낮아져도 벌점이다. 억제와 홍수를 양방향으로 막는다.
-                  전체 예측(약 23,600개)에 걸어야 GT 가 없는 위치의 오탐도 잡힌다.
-        박스 항 — 매칭된 예측을 GT 에 붙잡아 둔다. 점수만으로는 박스가 밀리는 것을 못 막는다.
+    ★ 점수 항을 앵커 전체에 양방향으로 걸면 안 된다 (Exp-004 실측)
+
+        처음에는 `mean |s_adv - s_clean|` 을 23,600개 앵커 전부에 걸었다.
+        검출은 완벽히 보존됐지만(dscore 0.0008, keepiou 0.89)
+        **L_decorr 이 0.921 에서 0.91 로 전혀 움직이지 않았다.**
+
+        그 앵커의 약 23,000개가 배경이다. 배경 점수까지 원래대로 고정하라는 것은
+        사실상 "백본 feature 를 건드리지 마라"와 같은 말이라 자유도가 남지 않는다.
+
+        그런데 ByteTrack 은 tau(=0.1) 아래를 아예 보지 못한다.
+        배경 점수가 0.001 이든 0.05 든 트래커에는 동일하다. 지킬 필요가 없다.
+
+        그래서 배경은 **단방향**으로 바꾼다 — tau 위로 올라가는 것만 막는다.
+        오탐 홍수(Exp-003)는 여전히 막히고, 2만여 앵커가 tau 아래에서 자유로워진다.
+
+    세 항의 역할:
+        보이는 검출 (s_clean > tau) — 양방향. 억제도 증폭도 막는다
+        배경      (s_clean <= tau) — 단방향. tau 를 넘을 때만 벌점 (오탐 홍수 차단)
+        박스                        — 매칭된 예측을 GT 에 고정. 점수만으로는 박스 이동을 못 막는다
 
     이 제약을 건 채로도 L_decorr 이 내려가면 진짜 연관 공격이다.
     내려가지 않으면 그것도 결론이다 — TBD 트래커에서 검출을 건드리지 않고
@@ -229,20 +244,32 @@ def detection_keep_loss(scores_adv, scores_clean, boxes_adv, boxes_gt):
         scores_adv, scores_clean : [B, N]  obj * cls. clean 은 detach 되어 있어야 한다
         boxes_adv : [M, 5] (batch_idx, xyxy)  매칭된 예측 박스
         boxes_gt  : [M, 5] 대응하는 GT
+        tau       : 트래커가 보는 최소 점수. ByteTrack 의 2차 매칭 하한 0.1
 
     Returns:
         loss  : 스칼라
-        parts : {'dscore': 점수 평균 편차, 'keepiou': 박스-GT 평균 IoU}
+        parts : {'dscore': 보이는 검출의 점수 편차,
+                 'bgup'  : 배경이 tau 를 넘은 정도,
+                 'keepiou': 박스-GT 평균 IoU}
     """
-    d_score = (scores_adv - scores_clean).abs().mean()
+    zero = scores_adv.sum() * 0.0
+    vis = scores_clean > tau
+
+    d_score = ((scores_adv[vis] - scores_clean[vis]).abs().mean()
+               if vis.any() else zero)
+    bg_up = (torch.relu(scores_adv[~vis] - tau).mean()
+             if (~vis).any() else zero)
+
+    loss = d_score + bg_up
+    parts = {'dscore': d_score.item(), 'bgup': bg_up.item(),
+             'keepiou': float('nan')}
 
     if boxes_adv.numel() == 0:
-        return d_score, {'dscore': d_score.item(), 'keepiou': float('nan')}
+        return loss, parts
 
     iou = _diag_iou(boxes_adv[:, 1:], boxes_gt[:, 1:])
-    box_term = (1.0 - iou).mean()
-    return d_score + box_term, {'dscore': d_score.item(),
-                                'keepiou': iou.mean().item()}
+    parts['keepiou'] = iou.mean().item()
+    return loss + (1.0 - iou).mean(), parts
 
 
 def temporal_iou_loss(boxes_t, boxes_t1, ids_t, ids_t1):

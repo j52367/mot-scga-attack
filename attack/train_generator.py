@@ -102,6 +102,11 @@ def get_parser():
                         '연관이 아니라 검출을 무너뜨린다 (Exp-002/003 실측). '
                         '0 은 그 상태를 재현하는 ablation 용이다. '
                         '검출기 forward 가 프레임당 1회 늘어 약 40% 느려진다')
+    p.add_argument('--keep_tau', type=float, default=0.1,
+                   help='L_keep 이 "트래커가 본다"고 볼 최소 점수. ByteTrack 2차 매칭 하한. '
+                        '이 아래 배경 앵커는 tau 를 넘을 때만 벌점을 받는다. '
+                        '전부 양방향으로 고정하면 백본을 통째로 묶어 공격이 불가능해진다 '
+                        '(Exp-004 실측)')
     p.add_argument('--no_center', action='store_true',
                    help='서술자 중심화를 끈다. 켜두는 것이 기본이며, 끄면 다른 객체 간 '
                         '코사인이 +0.8 로 포화해 L_confuse 가 거의 학습을 이끌지 못한다')
@@ -415,14 +420,14 @@ def train_step(batch, student, teacher, detector, optimG, args, eps, device):
     # 이것이 없으면 최적화가 백본 feature 를 부수는 지름길을 택한다 (Exp-002/003).
     if args.w_keep > 0:
         l_keep = 0.0
-        acc = {'dscore': 0.0, 'keepiou': 0.0}
+        acc = {'dscore': 0.0, 'bgup': 0.0, 'keepiou': 0.0}
         for f, x_clean in ((ft, img_t), (fu, img_u)):
             lk, kp = detection_keep_loss(f['scores'],
                                          clean_scores(detector, x_clean, args),
-                                         f['box'], f['gt'])
+                                         f['box'], f['gt'], tau=args.keep_tau)
             l_keep = l_keep + lk
-            acc['dscore'] += kp['dscore'] / 2
-            acc['keepiou'] += kp['keepiou'] / 2
+            for k in acc:
+                acc[k] += kp[k] / 2
         loss = loss + args.w_keep * l_keep
         parts.update(acc)
 
@@ -517,7 +522,8 @@ def main():
     csv_file = open(csv_path, 'w', newline='')
     csv_w = csv.writer(csv_file)
     csv_w.writerow(['step', 'epoch', 'loss', 'decorr', 'confuse', 'iou',
-                    'dscore', 'keepiou', 'gen', 'skip', 'elapsed_s', 'vram_gb'])
+                    'dscore', 'bgup', 'keepiou', 'gen', 'skip',
+                    'elapsed_s', 'vram_gb'])
     t_start = time.time()
     total_steps = len(train_loader) * args.epochs
     print(f'총 {total_steps} 스텝 | 배치 {args.batch_size} | 로그 {csv_path}',
@@ -556,6 +562,7 @@ def main():
                                 round(parts['confuse'], 5),
                                 round(parts.get('iou', nan), 5),
                                 round(parts.get('dscore', nan), 5),
+                                round(parts.get('bgup', nan), 5),
                                 round(parts.get('keepiou', nan), 5),
                                 round(parts['gen'], 5), n_skip,
                                 round(el, 1), round(peak, 2)])
@@ -568,9 +575,10 @@ def main():
                     if 'iou' in parts:
                         line += f' iou={parts["iou"]:.4f}'
                     if 'dscore' in parts:
-                        # 검출 건강도. dscore 가 커지거나 keepiou 가 떨어지면
+                        # 검출 건강도. dscore/bgup 이 커지거나 keepiou 가 떨어지면
                         # 연관이 아니라 검출을 부수고 있는 것이다
                         line += (f' dscore={parts["dscore"]:.4f}'
+                                 f' bgup={parts["bgup"]:.4f}'
                                  f' keepiou={parts["keepiou"]:.4f}')
                     print(f'{line} gen={parts["gen"]:.4f} skip={n_skip} '
                           f'| VRAM {peak:.1f}GB | {el/60:.1f}분 경과, '
