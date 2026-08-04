@@ -36,7 +36,8 @@ from attack.dataset import (MOT17PairDataset, pair_collate,
 from attack.descriptor import object_descriptor
 from attack.generator_wrap import GeneratorWithFeatures
 from attack.losses import (attack_loss, apply_perturbation, temporal_iou_loss,
-                           generator_consistency_loss, update_ema)
+                           detection_keep_loss, generator_consistency_loss,
+                           update_ema)
 
 warnings.filterwarnings("ignore")
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -95,6 +96,12 @@ def get_parser():
                    help='L_iou 가중치. 같은 객체의 프레임 간 박스 겹침을 줄인다. '
                         'ByteTrack 처럼 외형을 쓰지 않는 트래커를 겨냥하려면 필요하다. '
                         '0 이면 끈다')
+    p.add_argument('--w_keep', type=float, default=1.0,
+                   help='L_keep 가중치. 검출(점수·박스)을 클린 상태로 붙잡아 둔다. '
+                        '0 으로 두면 최적화가 백본 feature 를 부수는 지름길을 택해 '
+                        '연관이 아니라 검출을 무너뜨린다 (Exp-002/003 실측). '
+                        '0 은 그 상태를 재현하는 ablation 용이다. '
+                        '검출기 forward 가 프레임당 1회 늘어 약 40% 느려진다')
     p.add_argument('--no_center', action='store_true',
                    help='서술자 중심화를 끈다. 켜두는 것이 기본이며, 끄면 다른 객체 간 '
                         '코사인이 +0.8 로 포화해 L_confuse 가 거의 학습을 이끌지 못한다')
@@ -285,21 +292,25 @@ def frame_descriptor(model, x01, boxes_gt, ids_gt, args):
         어느 쪽이든 기하 성분은 항상 예측 박스에서 오므로 gradient 는 유지된다.
 
     Returns:
-        d      : [M, C+4]   매칭 실패 시 [0, C+4]
-        ids    : [M]
-        m_pred : [M, 5] (batch_idx, xyxy) 매칭된 예측 박스. L_iou 가 쓴다.
+        dict
+            d      : [M, C+4]  서술자. 매칭 실패 시 [0, C+4]
+            ids    : [M]
+            box    : [M, 5] (batch_idx, xyxy) 매칭된 예측 박스. L_iou 가 쓴다
+            gt     : [M, 5] 대응하는 GT 박스.   L_keep 이 쓴다
+            scores : [B, N]  전체 예측 점수.    L_keep 이 쓴다
+                     (GT 가 없는 위치의 오탐까지 잡으려면 전체가 필요하다)
     """
     H, W = x01.shape[-2:]
 
     x_norm = normalize_for_detector(x01)
     feat, preds = forward_detector(model, x_norm, args.fpn_level)
-    pred_boxes, _ = preds_to_xyxy_scores(preds)
+    pred_boxes, scores = preds_to_xyxy_scores(preds)
 
     m_pred, m_gt, m_ids = assign_ids(pred_boxes, boxes_gt, ids_gt,
                                      iou_thr=args.iou_thr)
     if m_ids.numel() == 0:
-        return (torch.zeros(0, feat.shape[1] + 4, device=x01.device),
-                m_ids, m_pred)
+        return {'d': torch.zeros(0, feat.shape[1] + 4, device=x01.device),
+                'ids': m_ids, 'box': m_pred, 'gt': m_gt, 'scores': scores}
 
     if args.roi_source == 'gt':
         # ROI 는 GT 로 뽑고, 기하 성분만 예측 박스에서 가져온다
@@ -313,7 +324,16 @@ def frame_descriptor(model, x01, boxes_gt, ids_gt, args):
     else:
         d = object_descriptor(feat, m_pred, (H, W), alpha=args.alpha)
 
-    return d, m_ids, m_pred
+    return {'d': d, 'ids': m_ids, 'box': m_pred, 'gt': m_gt, 'scores': scores}
+
+
+def clean_scores(model, x01, args):
+    """클린 입력의 예측 점수. L_keep 의 기준값이라 gradient 가 필요 없다."""
+    with torch.no_grad():
+        _, preds = forward_detector(model, normalize_for_detector(x01),
+                                    args.fpn_level)
+        _, s = preds_to_xyxy_scores(preds)
+    return s
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -368,12 +388,11 @@ def train_step(batch, student, teacher, detector, optimG, args, eps, device):
                + generator_consistency_loss(ft_u, fs_u))
 
     # 5) 공격 손실
-    d_t, ids_t, box_t = frame_descriptor(detector, adv_t,
-                                         batch['boxes_t'].to(device),
-                                         batch['ids_t'].to(device), args)
-    d_u, ids_u, box_u = frame_descriptor(detector, adv_u,
-                                         batch['boxes_u'].to(device),
-                                         batch['ids_u'].to(device), args)
+    ft = frame_descriptor(detector, adv_t, batch['boxes_t'].to(device),
+                          batch['ids_t'].to(device), args)
+    fu = frame_descriptor(detector, adv_u, batch['boxes_u'].to(device),
+                          batch['ids_u'].to(device), args)
+    ids_t, ids_u = ft['ids'], fu['ids']
 
     # 두 프레임에 공통 ID 가 없으면 공격 손실을 계산할 수 없다.
     # (데이터셋에서 공통 ID 2개 이상인 쌍만 뽑았으므로 드물지만,
@@ -382,15 +401,30 @@ def train_step(batch, student, teacher, detector, optimG, args, eps, device):
     if len(common) < 2:
         return None
 
-    l_att, parts = attack_loss(d_t, d_u, ids_t, ids_u, lam=args.lam,
+    l_att, parts = attack_loss(ft['d'], fu['d'], ids_t, ids_u, lam=args.lam,
                                center=not args.no_center)
 
     # 6) 합산 + 갱신
     loss = l_att + args.w_consistency * gen_sim
     if args.w_iou > 0:
-        l_iou = temporal_iou_loss(box_t, box_u, ids_t, ids_u)
+        l_iou = temporal_iou_loss(ft['box'], fu['box'], ids_t, ids_u)
         loss = loss + args.w_iou * l_iou
         parts['iou'] = l_iou.item()
+
+    # L_keep — 검출을 클린 상태로 붙잡아 둔다.
+    # 이것이 없으면 최적화가 백본 feature 를 부수는 지름길을 택한다 (Exp-002/003).
+    if args.w_keep > 0:
+        l_keep = 0.0
+        acc = {'dscore': 0.0, 'keepiou': 0.0}
+        for f, x_clean in ((ft, img_t), (fu, img_u)):
+            lk, kp = detection_keep_loss(f['scores'],
+                                         clean_scores(detector, x_clean, args),
+                                         f['box'], f['gt'])
+            l_keep = l_keep + lk
+            acc['dscore'] += kp['dscore'] / 2
+            acc['keepiou'] += kp['keepiou'] / 2
+        loss = loss + args.w_keep * l_keep
+        parts.update(acc)
 
     loss.backward()
     optimG.step()
@@ -483,7 +517,7 @@ def main():
     csv_file = open(csv_path, 'w', newline='')
     csv_w = csv.writer(csv_file)
     csv_w.writerow(['step', 'epoch', 'loss', 'decorr', 'confuse', 'iou',
-                    'gen', 'skip', 'elapsed_s', 'vram_gb'])
+                    'dscore', 'keepiou', 'gen', 'skip', 'elapsed_s', 'vram_gb'])
     t_start = time.time()
     total_steps = len(train_loader) * args.epochs
     print(f'총 {total_steps} 스텝 | 배치 {args.batch_size} | 로그 {csv_path}',
@@ -516,10 +550,13 @@ def main():
                 el = time.time() - t_start
                 peak = (torch.cuda.max_memory_allocated() / 1024**3
                         if device.type == 'cuda' else 0.0)
+                nan = float('nan')
                 csv_w.writerow([gstep, epoch + 1, round(parts['loss'], 5),
                                 round(parts['decorr'], 5),
                                 round(parts['confuse'], 5),
-                                round(parts.get('iou', float('nan')), 5),
+                                round(parts.get('iou', nan), 5),
+                                round(parts.get('dscore', nan), 5),
+                                round(parts.get('keepiou', nan), 5),
                                 round(parts['gen'], 5), n_skip,
                                 round(el, 1), round(peak, 2)])
                 csv_file.flush()
@@ -530,6 +567,11 @@ def main():
                             f'con={parts["confuse"]:.4f}')
                     if 'iou' in parts:
                         line += f' iou={parts["iou"]:.4f}'
+                    if 'dscore' in parts:
+                        # 검출 건강도. dscore 가 커지거나 keepiou 가 떨어지면
+                        # 연관이 아니라 검출을 부수고 있는 것이다
+                        line += (f' dscore={parts["dscore"]:.4f}'
+                                 f' keepiou={parts["keepiou"]:.4f}')
                     print(f'{line} gen={parts["gen"]:.4f} skip={n_skip} '
                           f'| VRAM {peak:.1f}GB | {el/60:.1f}분 경과, '
                           f'남은 {eta:.0f}분', flush=True)

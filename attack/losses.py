@@ -197,6 +197,54 @@ def _diag_iou(a, b, eps=1e-7):
     return inter / (area_a + area_b - inter + eps)
 
 
+def detection_keep_loss(scores_adv, scores_clean, boxes_adv, boxes_gt):
+    """
+    L_keep — 검출을 클린 상태로 붙잡아 둔다.
+
+    왜 필요한가 (Exp-002 / Exp-003 실측):
+        서술자의 외형 성분은 `GAP(ROIAlign(F, b))` 이고, 검출 헤드도 같은 F 를 읽는다.
+
+            F = backbone(x)
+              +-> head(F)              -> 박스, 점수   (검출)
+              +-> GAP(ROIAlign(F, b))  -> 서술자 외형  (우리 공격)
+
+        따라서 L_decorr 을 낮추는 가장 쉬운 길은 F 를 난장판으로 만드는 것이고,
+        그러면 검출이 같이 죽는다. 최적화가 매번 그 지름길을 찾았다.
+
+            Exp-002 (w_iou 1.0)  Recall 62.8 -> 5.5,  Precision 89.7 -> 42.1
+            Exp-003 (w_iou 0)    Precision 0.1%, 프레임당 트랙 1,873개 (오탐 홍수)
+
+        w_iou 를 꺼도 같은 일이 났으므로 원인은 손실 항이 아니라 **분리 장치의 부재**다.
+
+    두 항의 역할:
+        점수 항 — 클린보다 높아져도 낮아져도 벌점이다. 억제와 홍수를 양방향으로 막는다.
+                  전체 예측(약 23,600개)에 걸어야 GT 가 없는 위치의 오탐도 잡힌다.
+        박스 항 — 매칭된 예측을 GT 에 붙잡아 둔다. 점수만으로는 박스가 밀리는 것을 못 막는다.
+
+    이 제약을 건 채로도 L_decorr 이 내려가면 진짜 연관 공격이다.
+    내려가지 않으면 그것도 결론이다 — TBD 트래커에서 검출을 건드리지 않고
+    연관만 공격하는 것이 불가능하다는 뜻이 된다.
+
+    Args:
+        scores_adv, scores_clean : [B, N]  obj * cls. clean 은 detach 되어 있어야 한다
+        boxes_adv : [M, 5] (batch_idx, xyxy)  매칭된 예측 박스
+        boxes_gt  : [M, 5] 대응하는 GT
+
+    Returns:
+        loss  : 스칼라
+        parts : {'dscore': 점수 평균 편차, 'keepiou': 박스-GT 평균 IoU}
+    """
+    d_score = (scores_adv - scores_clean).abs().mean()
+
+    if boxes_adv.numel() == 0:
+        return d_score, {'dscore': d_score.item(), 'keepiou': float('nan')}
+
+    iou = _diag_iou(boxes_adv[:, 1:], boxes_gt[:, 1:])
+    box_term = (1.0 - iou).mean()
+    return d_score + box_term, {'dscore': d_score.item(),
+                                'keepiou': iou.mean().item()}
+
+
 def temporal_iou_loss(boxes_t, boxes_t1, ids_t, ids_t1):
     """
     L_iou — 같은 객체의 프레임 간 박스 겹침을 줄인다.

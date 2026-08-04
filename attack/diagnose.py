@@ -323,8 +323,10 @@ def run_descriptor_check(args, model, attacker, device):
 
         for mode, (xt, xu) in (('clean', (img_t, img_u)),
                                ('attack', (adv_t, adv_u))):
-            d_t, ids_t, _ = frame_descriptor(model, xt, bt, it, args)
-            d_u, ids_u, _ = frame_descriptor(model, xu, bu, iu, args)
+            ft = frame_descriptor(model, xt, bt, it, args)
+            fu = frame_descriptor(model, xu, bu, iu, args)
+            d_t, ids_t = ft['d'], ft['ids']
+            d_u, ids_u = fu['d'], fu['ids']
             same, diff = descriptor_cosines(d_t, d_u, ids_t, ids_u,
                                             center=not args.no_center)
             if same is not None:

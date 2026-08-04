@@ -25,8 +25,9 @@ from attack.dataset import MOT17PairDataset, pair_collate
 from attack.descriptor import object_descriptor  # noqa: F401  (frame_descriptor 내부에서 사용)
 from attack.generator_wrap import GeneratorWithFeatures
 from attack.losses import (attack_loss, apply_perturbation, temporal_iou_loss,
-                           generator_consistency_loss, update_ema)
-from attack.train_generator import build_detector, frame_descriptor
+                           detection_keep_loss, generator_consistency_loss,
+                           update_ema)
+from attack.train_generator import build_detector, clean_scores, frame_descriptor
 
 
 def main():
@@ -48,6 +49,7 @@ def main():
     ap.add_argument('--delta_param', default='additive',
                     choices=['additive', 'image'])
     ap.add_argument('--w_iou', type=float, default=1.0)
+    ap.add_argument('--w_keep', type=float, default=1.0)
     ap.add_argument('--generator', default='resnet')
     ap.add_argument('--gap', action='store_true')
     ap.add_argument('--nat', action='store_true')
@@ -111,10 +113,10 @@ def main():
                + generator_consistency_loss(ft_u, fs_u))
 
     t0 = time.time()
-    d_t, ids_t, box_t = frame_descriptor(detector, adv_t, batch['boxes_t'],
-                                         batch['ids_t'], args)
-    d_u, ids_u, box_u = frame_descriptor(detector, adv_u, batch['boxes_u'],
-                                         batch['ids_u'], args)
+    ft = frame_descriptor(detector, adv_t, batch['boxes_t'], batch['ids_t'], args)
+    fu = frame_descriptor(detector, adv_u, batch['boxes_u'], batch['ids_u'], args)
+    d_t, ids_t, box_t = ft['d'], ft['ids'], ft['box']
+    d_u, ids_u, box_u = fu['d'], fu['ids'], fu['box']
     print(f'검출기 forward + 서술자 {time.time()-t0:.1f}초')
     print(f'  서술자 d_t{tuple(d_t.shape)}  매칭 ID {len(ids_t)}개')
     print(f'  서술자 d_u{tuple(d_u.shape)}  매칭 ID {len(ids_u)}개')
@@ -136,6 +138,17 @@ def main():
           f'<- 같은 객체의 프레임 간 박스 IoU (클린은 0.8~0.9)')
     if args.w_iou > 0:
         loss = loss + args.w_iou * l_iou
+
+    l_keep, kp = detection_keep_loss(ft['scores'],
+                                     clean_scores(detector, img_t, args),
+                                     ft['box'], ft['gt'])
+    print(f'      keep={l_keep.item():.4f}  (dscore={kp["dscore"]:.4f}, '
+          f'keepiou={kp["keepiou"]:.4f})')
+    print(f'        dscore 는 클린 대비 점수 편차, keepiou 는 예측-GT 겹침.')
+    print(f'        학습 중 dscore 가 커지거나 keepiou 가 떨어지면 '
+          f'검출을 부수고 있는 것이다.')
+    if args.w_keep > 0:
+        loss = loss + args.w_keep * l_keep
     print(f'      gen_sim={gen_sim.item():.4f}   total={loss.item():+.4f}\n')
 
     t0 = time.time()

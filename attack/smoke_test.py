@@ -190,6 +190,46 @@ def test_temporal_iou():
     print(f"{OK} 공통 ID 없음 -> 0 (에러 없이)")
 
 
+# ── 5d. L_keep ───────────────────────────────────────────────────
+def test_detection_keep():
+    from attack.losses import detection_keep_loss
+    print("[5d] L_keep — 검출 보존")
+
+    torch.manual_seed(0)
+    s_clean = torch.rand(1, 200)
+    gt = torch.tensor([[0., 100, 100, 200, 300],
+                       [0., 500, 150, 600, 400]])
+
+    # 검출이 그대로인 경우
+    l_same, p_same = detection_keep_loss(s_clean.clone(), s_clean,
+                                         gt.clone(), gt)
+    # 점수를 흔들고 박스도 밀어낸 경우
+    moved = gt.clone(); moved[:, 1:] += 150
+    l_bad, p_bad = detection_keep_loss(torch.rand(1, 200), s_clean, moved, gt)
+
+    print(f"       그대로={l_same.item():.4f} (dscore={p_same['dscore']:.4f}, "
+          f"keepiou={p_same['keepiou']:.3f})")
+    print(f"       망가짐={l_bad.item():.4f} (dscore={p_bad['dscore']:.4f}, "
+          f"keepiou={p_bad['keepiou']:.3f})")
+    assert l_same.item() < 1e-6, "검출이 그대로면 벌점 0"
+    assert l_bad.item() > l_same.item()
+    print(f"{OK} 검출이 유지되면 0, 흐트러지면 벌점")
+
+    # 점수가 '올라가도' 벌점이어야 오탐 홍수를 막는다 (Exp-003)
+    up = detection_keep_loss(s_clean + 0.3, s_clean, gt.clone(), gt)[0]
+    down = detection_keep_loss((s_clean - 0.3).clamp(min=0), s_clean,
+                               gt.clone(), gt)[0]
+    print(f"       점수 상승={up.item():.4f}  하락={down.item():.4f}")
+    assert up.item() > 0.2 and down.item() > 0.1
+    print(f"{OK} 점수는 양방향 벌점 — 억제와 오탐 홍수를 모두 막는다")
+
+    # 매칭이 하나도 없어도 죽지 않아야 한다
+    empty = torch.zeros(0, 5)
+    l0, p0 = detection_keep_loss(s_clean.clone(), s_clean, empty, empty)
+    assert l0.item() < 1e-6
+    print(f"{OK} 매칭 없음 -> 점수 항만 (에러 없이)")
+
+
 # ── 6. assign_ids — 예측-GT 매칭 ──────────────────────────────────
 def test_assign_ids():
     from attack.train_generator import assign_ids
@@ -260,7 +300,7 @@ def test_assign_ids_edge():
 if __name__ == '__main__':
     for fn in (test_descriptor_shape, test_gradient_flow, test_losses,
                test_loss_direction, test_scga_utils,
-               test_apply_perturbation, test_temporal_iou,
+               test_apply_perturbation, test_temporal_iou, test_detection_keep,
                test_assign_ids, test_assign_ids_edge):
         fn()
         print()
