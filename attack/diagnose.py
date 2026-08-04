@@ -63,6 +63,9 @@ class NoiseStats:
         self.absmax, self.absmean, self.sat = [], [], []
         self.const, self.resid_std = [], []
         self.pad_ratio = []
+        # 인접 프레임 간 섭동 변화 (결정론 가설 확인용)
+        self.prev = None
+        self.t_cos, self.t_sign = [], []
 
     def add(self, delta, eps, valid_hw=None):
         """
@@ -86,6 +89,15 @@ class NoiseStats:
             inside = d[:, :nh, :nw].abs().sum().item()
             self.pad_ratio.append(1.0 - inside / max(total, 1e-12))
 
+        # 인접 프레임과 비교 — 섭동이 시간에 따라 변하는가
+        if self.prev is not None:
+            p = self.prev
+            pr = p - p.mean(dim=(1, 2), keepdim=True)
+            self.t_cos.append(((r * pr).sum() /
+                               (r.norm() * pr.norm() + 1e-12)).item())
+            self.t_sign.append((torch.sign(d) == torch.sign(p)).float().mean().item())
+        self.prev = d.clone()
+
     def report(self, eps):
         m = lambda v: float(np.mean(v)) if v else float('nan')  # noqa: E731
         c, rs = m(self.const), m(self.resid_std)
@@ -95,13 +107,25 @@ class NoiseStats:
               f'(eps 대비 {m(self.absmean)/eps*100:.1f}%)')
         print(f'    +-eps 포화 비율   {m(self.sat)*100:.1f}%')
         print(f'    상수 성분 |c|     {c:.4f}      <- 전역 톤 이동 크기')
-        print(f'    잔차 표준편차     {rs:.4f}      <- 공간 구조 크기')
-        print(f'    구조/상수 비      {rs/max(c,1e-12):.2f}   '
-              f'(1 미만이면 사실상 톤 이동)')
+        print(f'    잔차 표준편차     {rs:.4f}      <- 공간 구조 크기 '
+              f'(eps 대비 {rs/eps*100:.0f}%)')
+        # 포화된 +-eps 이진 패턴은 구조/상수 비가 1 근처에 온다.
+        # (+eps 비율 p 일 때 이론값 = 2*sqrt(p(1-p)) / (2p-1), p=0.85 -> 1.03)
+        # 따라서 이 비율로는 '톤 이동'을 판정할 수 없다. 잔차 std 를 eps 와 비교한다.
+        if m(self.sat) > 0.5:
+            # p 를 역산해 보여준다
+            p = 0.5 * (c / eps + 1.0)
+            print(f'    -> 포화 이진 패턴: +eps {p*100:.0f}% / -eps {(1-p)*100:.0f}%')
         if self.pad_ratio:
             print(f'    패딩 영역 낭비    {m(self.pad_ratio)*100:.1f}% '
                   f'(예산이 회색 패딩에 쓰인 비율)')
-        return {'absmean': m(self.absmean), 'const': c, 'resid_std': rs}
+        if self.t_cos:
+            print(f'    인접 프레임 코사인 {m(self.t_cos):.4f}   '
+                  f'<- 1에 가까우면 섭동이 시간에 따라 변하지 않는다')
+            print(f'    부호 일치율        {m(self.t_sign)*100:.1f}%')
+        return {'absmean': m(self.absmean), 'const': c, 'resid_std': rs,
+                'sat': m(self.sat), 't_cos': m(self.t_cos) if self.t_cos else None,
+                't_sign': m(self.t_sign) if self.t_sign else None}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -210,6 +234,57 @@ def descriptor_cosines(d_t, d_u, ids_t, ids_u, center=True):
 
 
 @torch.no_grad()
+def perturbation_locking(delta_t, delta_u, boxes_t, boxes_u, ids_t, ids_u,
+                         out_size=16, min_disp=2.0):
+    """
+    섭동이 '객체를 따라 움직이는가(content-locked)' 아니면
+    '화면에 고정되어 있는가(screen-locked)' 를 가른다.
+
+    왜 이것이 결정적인가:
+        섭동이 객체를 따라 움직이면, 그 객체의 외형은 프레임 간에 여전히 안정적이다.
+        L_decorr 이 원리적으로 내려갈 수 없다. 에폭을 늘려도 뚫리지 않는 벽이다.
+
+    같은 ID 의 박스를 프레임 t / t+1 에서 각각 잘라내 비교한다.
+        A  cos( delta_t[box_t], delta_u[box_u] )   객체 정렬 — 객체가 실제로 겪는 섭동
+        B  cos( delta_t[box_t], delta_u[box_t] )   화면 고정 — 같은 화면 좌표
+
+        A > B  섭동이 객체를 따라 이동한다  -> 시간 불일치를 만들 수 없다
+        A < B  섭동이 화면에 고정되어 있다  -> 움직이는 객체는 매 프레임 다른 섭동을 겪는다
+
+    실제로 움직인 객체만 센다(min_disp 픽셀 이상). 정지한 객체는 A와 B가 같아진다.
+    """
+    from torchvision.ops import roi_align
+
+    i_t, i_u = _pair_by_id(ids_t, ids_u)
+    if i_t is None:
+        return None
+
+    bt, bu = boxes_t[i_t], boxes_u[i_u]                  # [M,5]
+    ct = torch.stack([(bt[:, 1] + bt[:, 3]) * .5, (bt[:, 2] + bt[:, 4]) * .5], 1)
+    cu = torch.stack([(bu[:, 1] + bu[:, 3]) * .5, (bu[:, 2] + bu[:, 4]) * .5], 1)
+    disp = (cu - ct).norm(dim=1)
+    keep = disp >= min_disp
+    if keep.sum() == 0:
+        return None
+    bt, bu, disp = bt[keep], bu[keep], disp[keep]
+
+    def crop(d, b):
+        c = roi_align(d, b, output_size=out_size, spatial_scale=1.0, aligned=True)
+        c = c.flatten(1)
+        return c - c.mean(dim=1, keepdim=True)           # DC 제거 후 구조만 비교
+
+    a_t = crop(delta_t, bt)
+    a_u = crop(delta_u, bu)          # 객체 정렬
+    b_u = crop(delta_u, bt)          # 화면 고정 (t 의 좌표에서 u 의 델타)
+
+    cos = lambda x, y: (x * y).sum(1) / (x.norm(dim=1) * y.norm(dim=1) + 1e-12)  # noqa: E731
+    return {'aligned': cos(a_t, a_u).mean().item(),
+            'screen': cos(a_t, b_u).mean().item(),
+            'disp': disp.mean().item(),
+            'n': int(keep.sum())}
+
+
+@torch.no_grad()
 def run_descriptor_check(args, model, attacker, device):
     ds = MOT17PairDataset(
         data_root=args.pair_root, split='train',
@@ -228,6 +303,7 @@ def run_descriptor_check(args, model, attacker, device):
     eps = args.eps / 255.0
 
     acc = {'clean': ([], []), 'attack': ([], [])}
+    lock = []
     n_used = 0
 
     for idx in picks:
@@ -237,10 +313,16 @@ def run_descriptor_check(args, model, attacker, device):
         bt, bu = batch['boxes_t'].to(device), batch['boxes_u'].to(device)
         it, iu = batch['ids_t'].to(device), batch['ids_u'].to(device)
 
-        for mode, (xt, xu) in (
-                ('clean', (img_t, img_u)),
-                ('attack', (project(_g(attacker, img_t), img_t, eps),
-                            project(_g(attacker, img_u), img_u, eps)))):
+        adv_t = project(_g(attacker, img_t), img_t, eps)
+        adv_u = project(_g(attacker, img_u), img_u, eps)
+
+        lk = perturbation_locking(adv_t - img_t, adv_u - img_u, bt, bu, it, iu,
+                                  min_disp=args.min_disp)
+        if lk is not None:
+            lock.append(lk)
+
+        for mode, (xt, xu) in (('clean', (img_t, img_u)),
+                               ('attack', (adv_t, adv_u))):
             d_t, ids_t = frame_descriptor(model, xt, bt, it, args)
             d_u, ids_u = frame_descriptor(model, xu, bu, iu, args)
             same, diff = descriptor_cosines(d_t, d_u, ids_t, ids_u,
@@ -267,8 +349,22 @@ def run_descriptor_check(args, model, attacker, device):
           f'<- 올라가야 성공')
     print(f'    {"판별 격차":16s} {cs-cd:10.4f} {as_-ad:10.4f} '
           f'{(as_-ad)-(cs-cd):+10.4f}   <- 줄어야 성공')
-    return {'same_clean': cs, 'same_attack': as_,
-            'diff_clean': cd, 'diff_attack': ad}
+
+    out = {'same_clean': cs, 'same_attack': as_,
+           'diff_clean': cd, 'diff_attack': ad, 'lock': None}
+
+    if lock:
+        al = m([l['aligned'] for l in lock])
+        sc = m([l['screen'] for l in lock])
+        dp = m([l['disp'] for l in lock])
+        nn = int(np.sum([l['n'] for l in lock]))
+        print(f'\n  [C] 섭동의 고정 방식 (움직인 객체 {nn}개, 평균 이동 {dp:.1f}px)')
+        print(f'    {"객체 정렬 A":16s} {al:10.4f}   섭동이 객체를 따라갔을 때의 유사도')
+        print(f'    {"화면 고정 B":16s} {sc:10.4f}   같은 화면 좌표에서의 유사도')
+        print(f'    {"A - B":16s} {al-sc:+10.4f}   '
+              f'양수면 content-locked (객체를 따라 이동)')
+        out['lock'] = {'aligned': al, 'screen': sc, 'disp': dp}
+    return out
 
 
 def _g(attacker, x):
@@ -331,42 +427,78 @@ def verdict(noise, det_clean, det_adv, desc, eps):
     print('=' * 66)
     lines = []
 
-    # 가설 1
-    ratio = noise['resid_std'] / max(noise['const'], 1e-12)
+    # ── 가설 1 : 노이즈가 유의미한가 ────────────────────────────
+    # 주의: 구조/상수 비로 판정하면 안 된다. 포화된 +-eps 이진 패턴은
+    #       그 비가 1 근처에 오므로 정상 패턴을 톤 이동으로 오판한다.
+    #       잔차 표준편차를 eps 와 직접 비교한다.
     if noise['absmean'] < 0.1 * eps:
         lines.append('가설 1 성립 — 노이즈가 eps 예산의 10% 도 쓰지 않는다. '
                      'generator 가 사실상 학습되지 않았다.')
-    elif ratio < 1.0:
-        lines.append('가설 1 성립 — delta 에 공간 구조가 거의 없다(전역 톤 이동). '
-                     '공격이 아니라 색보정을 배운 것이며, 이것이 IDF1 상승을 설명한다.')
+    elif noise['resid_std'] < 0.15 * eps:
+        lines.append('가설 1 성립 — 잔차가 eps 의 15% 미만이다. 사실상 전역 톤 이동이며, '
+                     '공격이 아니라 색보정을 배운 것이다.')
     else:
-        lines.append('가설 1 기각 — delta 에 공간 구조가 있다. 노이즈 자체는 유의미하다.')
+        lines.append(f'가설 1 기각 — 잔차가 eps 의 '
+                     f'{noise["resid_std"]/eps*100:.0f}% 다. 공간 구조가 충분하고 '
+                     f'예산도 {noise["absmean"]/eps*100:.0f}% 쓰고 있다.')
 
-    # 가설 4
+    # ── 가설 4 : 검출 분포가 어떻게 변했는가 ───────────────────
     dl = det_adv['low'] - det_clean['low']
     dh = det_adv['high'] - det_clean['high']
-    if dl < -0.1 * max(det_clean['low'], 1e-9) and dh >= -0.05 * max(det_clean['high'], 1e-9):
-        lines.append(f'가설 4 성립 — low 검출이 {dl:+.1f} 줄고 high 는 {dh:+.1f} 로 유지됐다. '
-                     '공격이 2차 매칭 후보를 청소해 ByteTrack 을 도와준 것이다.')
-    elif dh < -0.1 * max(det_clean['high'], 1e-9):
-        lines.append(f'가설 4 기각 — high 검출이 {dh:+.1f} 로 실제 감소했다. '
+    rl = dl / max(det_clean['low'], 1e-9)
+    rh = dh / max(det_clean['high'], 1e-9)
+    if rh < -0.10:
+        lines.append(f'검출: high 가 {dh:+.1f} ({rh*100:+.0f}%) 로 실제 감소했다. '
                      '검출은 무너뜨렸으나 추적이 버틴 경우다.')
+    elif rl < -0.10 and rh > -0.05:
+        lines.append(f'가설 4 성립 — low 가 {dl:+.1f} ({rl*100:+.0f}%) 줄고 high 는 유지됐다. '
+                     '공격이 2차 매칭 후보를 청소해 ByteTrack 을 도와준 것이다.')
+    elif rl > 0.10:
+        lines.append(f'가설 4 기각(반대 방향) — low 가 {dl:+.1f} ({rl*100:+.0f}%) 늘고 '
+                     f'high 는 {dh:+.1f} ({rh*100:+.0f}%) 로 소폭 감소했다. '
+                     'high 감소가 FP 트랙 생성을 줄여 Precision 을 올리고, '
+                     'low 증가가 2차 매칭 재료를 늘려 IDSW 를 줄인 것으로 읽힌다.')
     else:
-        lines.append('가설 4 판단 보류 — 검출 분포가 거의 변하지 않았다.')
+        lines.append('검출 분포가 거의 변하지 않았다.')
 
-    # B
+    # ── B : 목적함수가 평가 구간에서 작동하는가 ────────────────
     if desc is not None:
         d_same = desc['same_attack'] - desc['same_clean']
         if abs(d_same) < 0.02:
-            lines.append(f'★ 평가 구간에서 같은-ID 코사인이 {d_same:+.4f} 로 거의 변하지 않았다. '
-                         '학습된 공격이 평가 구간에 일반화되지 않았다 -> 가설 2(학습 부족)로.')
+            lines.append(f'★ 같은-ID 코사인이 {d_same:+.4f} 로 거의 변하지 않았다. '
+                         '목적함수가 실질적으로 움직이지 않았다.')
         elif d_same < -0.05:
             lines.append(f'★ 같은-ID 코사인이 {d_same:+.4f} 로 실제 내려갔다. '
-                         '서술자는 무너뜨렸는데 추적은 멀쩡하다 -> 가설 3(손실-실효 불일치) 확정. '
+                         '서술자는 무너뜨렸는데 추적은 멀쩡하다 -> 손실-실효 불일치 확정. '
                          '이 자체가 논문에 쓸 수 있는 발견이다.')
         else:
             lines.append(f'★ 같은-ID 코사인이 {d_same:+.4f} 로 오히려 올라갔다. '
-                         '손실 부호나 최적화 방향을 다시 볼 것 -> 가설 5.')
+                         '손실 부호나 최적화 방향을 다시 볼 것.')
+
+    # ── C : 왜 움직이지 않는가 ─────────────────────────────────
+    if desc is not None and desc.get('lock'):
+        lk = desc['lock']
+        gap = lk['aligned'] - lk['screen']
+        if gap > 0.05:
+            lines.append(f'★★ 섭동이 content-locked 다 (A-B = {gap:+.4f}). '
+                         '섭동이 객체를 따라 이동하므로 객체의 외형은 프레임 간에 안정적으로 '
+                         '남는다. 단일 이미지 생성기는 결정론적이라 I_t ~ I_t+1 이면 '
+                         'delta_t ~ delta_t+1 이 되고, 이는 에폭을 늘려도 뚫리지 않는 '
+                         '구조적 한계다. 생성기에 시간 조건(프레임 위상)을 넣거나 '
+                         '섭동을 화면 고정으로 만들어야 한다.')
+        elif gap < -0.05:
+            lines.append(f'섭동이 screen-locked 다 (A-B = {gap:+.4f}). '
+                         '움직이는 객체는 매 프레임 다른 섭동을 겪는다. '
+                         '메커니즘은 갖췄으므로 강도(eps, 에폭)나 손실 설계를 볼 것.')
+        else:
+            lines.append(f'A-B = {gap:+.4f} 로 판단 보류. min_disp 를 올려 '
+                         '실제로 크게 움직인 객체만 보고 다시 확인할 것.')
+
+    if noise.get('t_cos') is not None:
+        lines.append(f'참고 — 인접 프레임 섭동 코사인 {noise["t_cos"]:.4f}, '
+                     f'부호 일치율 {noise["t_sign"]*100:.0f}%. '
+                     '화면 전체 기준이라 정지 배경 때문에 높게 나오는 것이 정상이다. '
+                     '판단은 위 [C] 로 한다.')
 
     for i, s in enumerate(lines, 1):
         print(f'  {i}. {s}')
@@ -411,6 +543,8 @@ def main():
     ap.add_argument('--n_frames', type=int, default=50, help='A부 프레임 수')
     ap.add_argument('--n_pairs', type=int, default=30, help='B부 프레임 쌍 수')
     ap.add_argument('--n_dump', type=int, default=3, help='저장할 이미지 세트 수')
+    ap.add_argument('--min_disp', type=float, default=2.0,
+                    help='[C] 에서 "움직였다"고 볼 최소 중심 이동 (레터박스 픽셀)')
     ap.add_argument('--out', default='output/diagnose')
     ap.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     ap.add_argument('--skip_desc', action='store_true', help='B부 건너뛰기')
