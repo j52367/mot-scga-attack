@@ -165,6 +165,33 @@ PYTHONPATH=. python attack/train_generator.py \
 결과는 `experiments/<시각>_<method>_<generator>/` 에 저장된다.
 저장되는 것은 student가 아니라 **teacher(EMA)** 이다.
 
+### 오래 걸리는 학습은 백그라운드로
+
+SSH 를 끊어도 계속 돌도록 `nohup` 으로 띄우고 로그를 파일에 남긴다.
+
+```bash
+nohup python attack/train_generator.py \
+    --data_root datasets/mot \
+    --exp_file exps/example/mot/yolox_s_mix_det.py \
+    --ckpt pretrained/bytetrack_s_mot17.pth.tar \
+    --batch_size 4 --epochs 3 --w_iou 1.0 \
+    > logs/train.log 2>&1 &
+```
+
+터미널이 아니면 tqdm 을 자동으로 끄고 `--log_every` (기본 50) 마다 평문 한 줄만 남긴다.
+tqdm 은 `\r` 로 덮어쓰기 때문에 파일로 넘기면 읽을 수 없다.
+
+```
+[1/3] 50/5949 loss=1.8021 dec=0.9612 con=0.0488 iou=0.8433 gen=0.0000 skip=0 | 0.8분 경과, 남은 92분
+```
+
+같은 값이 `experiments/<폴더>/loss_log.csv` 에도 쌓인다 (손실 곡선용).
+
+```bash
+tail -f logs/train.log          # 진행 보기
+nvidia-smi                       # 살아 있는지 확인
+```
+
 ### 섭동 파라미터화 (`--delta_param`)
 
 SCGA/BIA 원본(`image`)은 generator 가 `tanh` 로 **이미지 한 장**을 내고 그것을 eps 상자로 자른다.

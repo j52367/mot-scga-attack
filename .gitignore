@@ -148,6 +148,7 @@ datasets/mot20
 # 학습 산출물
 experiments/
 *.log
+logs/
 
 # 가상환경
 .venv/

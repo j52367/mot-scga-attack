@@ -11,9 +11,12 @@ surrogate(분류 CNN -> 검출기)와 손실(분류 feature -> 시간 일관성)
 
 import argparse
 import copy
+import csv
 import datetime
 import os
 import shutil
+import sys
+import time
 import warnings
 
 import torch
@@ -52,6 +55,9 @@ def get_parser():
     p.add_argument('--gpu_id', type=int, default=0)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--save_freq', type=int, default=200)
+    p.add_argument('--log_every', type=int, default=50,
+                   help='이 간격마다 손실을 한 줄로 찍고 loss_log.csv 에 기록한다. '
+                        'nohup 으로 파일에 남길 때 tqdm 대신 이것을 읽는다')
     p.add_argument('--output_dir', type=str, default='./experiments')
     p.add_argument('--method', type=str, default='ptca')
     p.add_argument('--ema_momentum', type=float, default=0.999)
@@ -355,10 +361,25 @@ def main():
 
     eps = args.eps / 255.0
 
+    # ── 손실 기록 ───────────────────────────────────────────────
+    # nohup 으로 파일에 남길 때 tqdm 은 \r 로 덮어써서 읽을 수 없다.
+    # 터미널이 아니면 tqdm 을 끄고 log_every 마다 평문 한 줄만 남긴다.
+    is_tty = sys.stderr.isatty()
+    csv_path = os.path.join(args.output_dir, 'loss_log.csv')
+    csv_file = open(csv_path, 'w', newline='')
+    csv_w = csv.writer(csv_file)
+    csv_w.writerow(['step', 'epoch', 'loss', 'decorr', 'confuse', 'iou',
+                    'gen', 'skip', 'elapsed_s'])
+    t_start = time.time()
+    gstep = 0
+    total_steps = len(train_loader) * args.epochs
+    print(f'총 {total_steps} 스텝 | 로그 {csv_path}', flush=True)
+
     # ── 학습 루프 (SCGA 그대로) ────────────────────────────────
     n_skip = 0
     for epoch in range(args.epochs):
-        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{args.epochs}', ncols=90)
+        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{args.epochs}', ncols=90,
+                    disable=not is_tty)
         for it, batch in enumerate(pbar):
             img_t = batch['img_t'].to(device, non_blocking=True)
             img_u = batch['img_u'].to(device, non_blocking=True)
@@ -422,15 +443,36 @@ def main():
                 post['iou'] = f'{parts["iou"]:.3f}'
             pbar.set_postfix(**post)
 
-            # 7) 저장 (SCGA 는 student 가 아니라 teacher 를 저장한다)
+            # 7) 기록
+            gstep += 1
+            if gstep % args.log_every == 0 or gstep == 1:
+                el = time.time() - t_start
+                csv_w.writerow([gstep, epoch + 1, round(loss.item(), 5),
+                                round(parts['decorr'], 5),
+                                round(parts['confuse'], 5),
+                                round(parts.get('iou', float('nan')), 5),
+                                round(gen_sim.item(), 5), n_skip, round(el, 1)])
+                csv_file.flush()
+                if not is_tty:
+                    eta = el / gstep * (total_steps - gstep) / 60
+                    line = (f'[{epoch+1}/{args.epochs}] {gstep}/{total_steps} '
+                            f'loss={loss.item():.4f} dec={parts["decorr"]:.4f} '
+                            f'con={parts["confuse"]:.4f}')
+                    if 'iou' in parts:
+                        line += f' iou={parts["iou"]:.4f}'
+                    print(f'{line} gen={gen_sim.item():.4f} skip={n_skip} '
+                          f'| {el/60:.1f}분 경과, 남은 {eta:.0f}분', flush=True)
+
+            # 8) 저장 (SCGA 는 student 가 아니라 teacher 를 저장한다)
             if it > 0 and it % args.save_freq == 0:
                 torch.save(teacher.state_dict(),
                            os.path.join(args.output_dir,
                                         f'teacher_{args.method}_{epoch}.pth'))
 
+    csv_file.close()
     torch.save(teacher.state_dict(),
                os.path.join(args.output_dir, f'teacher_{args.method}_final.pth'))
-    print('saved:', args.output_dir)
+    print(f'saved: {args.output_dir}  ({(time.time()-t_start)/60:.1f}분)', flush=True)
 
 
 if __name__ == '__main__':
