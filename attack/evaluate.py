@@ -97,7 +97,7 @@ def run_sequence(seq_dir, model, attacker, args, device):
             if isinstance(adv, tuple):
                 adv = adv[0]
             # 학습 때와 같은 파라미터화를 써야 한다. 다르면 공격이 성립하지 않는다.
-            x = apply_perturbation(adv, x, eps, args.delta_param)
+            x = apply_perturbation(adv, x, eps, args.delta_param, args.zero_dc)
 
         # ── 검출 ─────────────────────────────────────────────
         out = model(normalize_for_detector(x))
@@ -144,6 +144,8 @@ def main():
     ap.add_argument('--eps', type=float, default=10)
     ap.add_argument('--delta_param', default='additive',
                     choices=['additive', 'image'],
+                    help='★ 학습 때 쓴 값과 반드시 같아야 한다')
+    ap.add_argument('--zero_dc', action='store_true',
                     help='★ 학습 때 쓴 값과 반드시 같아야 한다')
     ap.add_argument('--generator', default='resnet')
     ap.add_argument('--gap', action='store_true')

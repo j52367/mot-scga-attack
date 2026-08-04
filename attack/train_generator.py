@@ -96,6 +96,12 @@ def get_parser():
                    help='L_iou 가중치. 같은 객체의 프레임 간 박스 겹침을 줄인다. '
                         'ByteTrack 처럼 외형을 쓰지 않는 트래커를 겨냥하려면 필요하다. '
                         '0 이면 끈다')
+    p.add_argument('--zero_dc', action='store_true',
+                   help='섭동에서 상수 성분(전역 톤 이동)을 제거한다. '
+                        'L_keep 을 걸면 최적화가 톤 이동으로 붕괴하는데 '
+                        '(실측: 예산의 92.6% 를 쓰면서 잔차는 eps 의 10%, '
+                        '같은-ID 코사인 변화 +0.0003) 그 자명해를 금지한다. '
+                        'additive 방식에서만 쓴다')
     p.add_argument('--w_keep', type=float, default=1.0,
                    help='L_keep 가중치. 검출(점수·박스)을 클린 상태로 붙잡아 둔다. '
                         '0 으로 두면 최적화가 백본 feature 를 부수는 지름길을 택해 '
@@ -385,8 +391,8 @@ def train_step(batch, student, teacher, detector, optimG, args, eps, device):
     adv_u, fs_u = student(img_u, feat=True)
 
     # 3) eps 예산 적용
-    adv_t = apply_perturbation(adv_t, img_t, eps, args.delta_param)
-    adv_u = apply_perturbation(adv_u, img_u, eps, args.delta_param)
+    adv_t = apply_perturbation(adv_t, img_t, eps, args.delta_param, args.zero_dc)
+    adv_u = apply_perturbation(adv_u, img_u, eps, args.delta_param, args.zero_dc)
 
     # 4) SCGA 일관성 손실
     gen_sim = (generator_consistency_loss(ft_t, fs_t)

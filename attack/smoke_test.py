@@ -157,6 +157,27 @@ def test_apply_perturbation():
     print(f"{OK} image 는 클리핑으로 gradient 가 죽고, additive 는 살아 있다")
     print(f"{OK} 두 방식 모두 eps 예산과 [0,1] 을 지킨다")
 
+    # zero_dc — 전역 톤 이동(자명해)을 표현할 수 없어야 한다
+    const = torch.full((1, 3, 32, 32), 0.9)               # 균일한 상수 출력
+    d_plain = apply_perturbation(const, img, eps, 'additive') - img
+    d_nodc = apply_perturbation(const, img, eps, 'additive', zero_dc=True) - img
+    c_plain = d_plain.mean(dim=(2, 3)).abs().mean().item()
+    c_nodc = d_nodc.mean(dim=(2, 3)).abs().mean().item()
+    print(f"       상수 출력의 DC 성분   기본={c_plain:.4f}  zero_dc={c_nodc:.4f}")
+    assert c_plain > 0.5 * eps, "기본 방식은 톤 이동을 그대로 통과시킨다"
+    assert c_nodc < 0.01 * eps, "zero_dc 는 상수 성분을 제거해야 한다"
+    print(f"{OK} zero_dc 는 전역 톤 이동을 표현할 수 없다")
+
+    # 구조가 있는 출력은 예산을 그대로 쓰면서 gradient 도 살아야 한다
+    r = torch.randn(1, 3, 32, 32).requires_grad_(True)
+    out = apply_perturbation(r, img, eps, 'additive', zero_dc=True)
+    dev = (out - img).abs()
+    assert dev.max().item() <= eps + 1e-6, "zero_dc 여도 eps 예산은 지켜야 한다"
+    out.sum().backward()
+    assert (r.grad.abs() == 0).float().mean().item() < 0.01
+    print(f"       구조 있는 출력  평균 |delta|={dev.mean().item()/eps*100:.0f}% of eps")
+    print(f"{OK} 예산은 유지되고 gradient 도 살아 있다")
+
 
 # ── 5c. L_iou ────────────────────────────────────────────────────
 def test_temporal_iou():

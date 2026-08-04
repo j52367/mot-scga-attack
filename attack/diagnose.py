@@ -313,8 +313,8 @@ def run_descriptor_check(args, model, attacker, device):
         bt, bu = batch['boxes_t'].to(device), batch['boxes_u'].to(device)
         it, iu = batch['ids_t'].to(device), batch['ids_u'].to(device)
 
-        adv_t = apply_perturbation(_g(attacker, img_t), img_t, eps, args.delta_param)
-        adv_u = apply_perturbation(_g(attacker, img_u), img_u, eps, args.delta_param)
+        adv_t = apply_perturbation(_g(attacker, img_t), img_t, eps, args.delta_param, args.zero_dc)
+        adv_u = apply_perturbation(_g(attacker, img_u), img_u, eps, args.delta_param, args.zero_dc)
 
         lk = perturbation_locking(adv_t - img_t, adv_u - img_u, bt, bu, it, iu,
                                   min_disp=args.min_disp)
@@ -400,7 +400,7 @@ def run_frames(args, model, attacker, device, dump_dir):
         img, r = letterbox(img_bgr, (args.input_h, args.input_w))
         x = torch.from_numpy(img).unsqueeze(0).to(device)
 
-        adv = apply_perturbation(_g(attacker, x), x, eps, args.delta_param)
+        adv = apply_perturbation(_g(attacker, x), x, eps, args.delta_param, args.zero_dc)
         ns.add(adv - x, eps, valid_hw=(int(ih * r), int(iw * r)))
 
         for xx, st in ((x, det_clean), (adv, det_adv)):
@@ -534,6 +534,8 @@ def main():
     ap.add_argument('--eps', type=float, default=10)
     ap.add_argument('--delta_param', default='additive',
                     choices=['additive', 'image'],
+                    help='★ 학습 때 쓴 값과 반드시 같아야 한다')
+    ap.add_argument('--zero_dc', action='store_true',
                     help='★ 학습 때 쓴 값과 반드시 같아야 한다')
     ap.add_argument('--generator', default='resnet')
     ap.add_argument('--gap', action='store_true')

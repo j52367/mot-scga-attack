@@ -152,7 +152,7 @@ def project(adv, img, eps):
 #  섭동 파라미터화
 # ══════════════════════════════════════════════════════════════════
 
-def apply_perturbation(raw, img, eps, mode='additive'):
+def apply_perturbation(raw, img, eps, mode='additive', zero_dc=False):
     """
     generator 출력 raw 를 적대 이미지로 만든다.
 
@@ -173,12 +173,40 @@ def apply_perturbation(raw, img, eps, mode='additive'):
         (경계 [0,1] clamp 는 남지만 실제로 걸리는 픽셀은 소수다)
 
     두 방식을 플래그로 남겨 ablation 으로 쓴다 (DESIGN.md A8).
+
+    zero_dc — 자명해 금지 (Exp-006 진단 결과)
+
+        L_keep 을 걸면 최적화가 **전역 톤 이동**으로 붕괴한다.
+        모든 픽셀을 같은 값만큼 밀면 검출 점수가 거의 그대로라 L_keep 이 공짜로
+        만족되고, 서술자도 움직이지 않아 공격이 아무것도 하지 않는다.
+
+            w_keep 1.0 실측: 평균 |delta| 가 eps 의 92.6% 인데
+                             그중 상수 성분이 0.0363, 잔차는 0.0039 (eps 의 10%)
+                             같은-ID 코사인 변화 +0.0003 — 사실상 무공격
+
+        w_keep 을 0.1 만 걸어도 곧장 이 해로 떨어진다. 거기서 벗어나려면
+        L_keep 을 일시적으로 올려야 하는데 경사하강은 그렇게 하지 않는다.
+
+        그래서 채널별 공간 평균을 빼서 **상수 이동을 표현할 수 없게** 만든다.
+        표준화 후 tanh 를 통과시키므로 예산은 그대로 쓰되 모든 픽셀에 gradient 가 흐른다.
+        (clamp 를 쓰면 잘린 곳의 gradient 가 죽는다 — 위 'image' 방식이 그래서 실패했다)
     """
-    if mode == 'additive':
-        return torch.clamp(img + eps * raw, 0.0, 1.0)
     if mode == 'image':
+        if zero_dc:
+            raise ValueError("zero_dc 는 additive 방식에서만 쓴다")
         return project(raw, img, eps)
-    raise ValueError(f'알 수 없는 delta_param: {mode}')
+    if mode != 'additive':
+        raise ValueError(f'알 수 없는 delta_param: {mode}')
+
+    if zero_dc:
+        r = raw - raw.mean(dim=(2, 3), keepdim=True)          # 상수 성분 제거
+        # 하한 1e-3 은 크기가 아니라 안전장치다. 출력이 거의 상수면 r 이 부동소수점
+        # 잔차만 남는데, 그것을 자기 std 로 나누면 수치 잡음이 증폭돼 없던 구조가 생긴다.
+        # 하한을 두면 그 경우 delta 가 0 으로 수렴한다.
+        # 학습된 generator 의 공간 std 는 0.1~0.6 이라 이 하한에 걸리지 않는다.
+        r = r / r.std(dim=(2, 3), keepdim=True).clamp(min=1e-3)
+        raw = torch.tanh(r)                                   # [-1,1], gradient 생존
+    return torch.clamp(img + eps * raw, 0.0, 1.0)
 
 
 # ══════════════════════════════════════════════════════════════════

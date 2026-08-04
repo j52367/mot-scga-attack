@@ -50,6 +50,7 @@ def main():
                     choices=['additive', 'image'])
     ap.add_argument('--w_iou', type=float, default=1.0)
     ap.add_argument('--w_keep', type=float, default=1.0)
+    ap.add_argument('--zero_dc', action='store_true')
     ap.add_argument('--generator', default='resnet')
     ap.add_argument('--gap', action='store_true')
     ap.add_argument('--nat', action='store_true')
@@ -102,8 +103,8 @@ def main():
     print(f'  블록 feature {len(ft_t)}개: ' +
           ', '.join(f'{tuple(f.shape[1:])}' for f in ft_t))
 
-    adv_t = apply_perturbation(adv_t, img_t, eps, args.delta_param)
-    adv_u = apply_perturbation(adv_u, img_u, eps, args.delta_param)
+    adv_t = apply_perturbation(adv_t, img_t, eps, args.delta_param, args.zero_dc)
+    adv_u = apply_perturbation(adv_u, img_u, eps, args.delta_param, args.zero_dc)
     d = (adv_t - img_t)
     print(f'  eps 적용 후 최대 편차 {d.abs().max():.4f}  (eps={eps:.4f})')
     print(f'  포화 비율 {(d.abs() >= 0.99*eps).float().mean()*100:.1f}% '
