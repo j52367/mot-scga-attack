@@ -170,13 +170,17 @@ PYTHONPATH=. python attack/train_generator.py \
 SSH 를 끊어도 계속 돌도록 `nohup` 으로 띄우고 로그를 파일에 남긴다.
 
 ```bash
-nohup python attack/train_generator.py \
+mkdir -p logs
+PYTHONPATH=. nohup python attack/train_generator.py \
     --data_root datasets/mot \
     --exp_file exps/example/mot/yolox_s_mix_det.py \
     --ckpt pretrained/bytetrack_s_mot17.pth.tar \
     --batch_size 4 --epochs 3 --w_iou 1.0 \
     > logs/train.log 2>&1 &
 ```
+
+`PYTHONPATH=.` 를 빠뜨리면 `ModuleNotFoundError: No module named 'generator'` 로 즉시 죽는다.
+저장소 루트에서 실행하는 다른 명령과 마찬가지다.
 
 터미널이 아니면 tqdm 을 자동으로 끄고 `--log_every` (기본 50) 마다 평문 한 줄만 남긴다.
 tqdm 은 `\r` 로 덮어쓰기 때문에 파일로 넘기면 읽을 수 없다.
