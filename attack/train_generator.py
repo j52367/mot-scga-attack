@@ -19,6 +19,11 @@ import sys
 import time
 import warnings
 
+# MOT 는 프레임마다 객체 수가 달라 중간 텐서 크기가 계속 바뀐다.
+# 기본 할당자는 그 때문에 조각이 심하게 나므로 expandable_segments 를 켠다.
+# torch import 전에 설정해야 적용된다. 사용자가 지정했으면 그대로 둔다.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
 import torch
 import torch.optim as optim
 from tqdm import tqdm
@@ -55,6 +60,8 @@ def get_parser():
     p.add_argument('--gpu_id', type=int, default=0)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--save_freq', type=int, default=200)
+    p.add_argument('--resume', type=str, default=None,
+                   help='ckpt_last.pth 경로. 에폭 단위로 이어받는다')
     p.add_argument('--log_every', type=int, default=50,
                    help='이 간격마다 손실을 한 줄로 찍고 loss_log.csv 에 기록한다. '
                         'nohup 으로 파일에 남길 때 tqdm 대신 이것을 읽는다')
@@ -313,6 +320,100 @@ def frame_descriptor(model, x01, boxes_gt, ids_gt, args):
 #  메인  (SCGA train_BIA_ours.py 골격 그대로)
 # ══════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════
+#  한 스텝
+# ══════════════════════════════════════════════════════════════════
+
+def train_step(batch, student, teacher, detector, optimG, args, eps, device):
+    """
+    학습 한 스텝. 반환값은 float 뿐이라 그래프 참조가 함수 밖으로 새지 않는다.
+
+    ★ 왜 함수로 뺐나 — OOM 때문이다.
+
+        루프 본문에 그대로 두면 adv_t / fs_t / d_t / box_t 같은 그래프 참조가
+        **다음 반복이 새 forward 를 다 만들 때까지 살아 있다.**
+        파이썬은 재대입 시점에 이전 값을 버리는데, 그 시점이 새 activation 을
+        이미 다 할당한 뒤다. 즉 한때 두 스텝분 활성값이 동시에 잡힌다.
+
+        더 나쁜 것은 공통 ID 부족으로 건너뛰는 경로다. backward 를 부르지 않으므로
+        그래프가 통째로 살아남아 다음 스텝까지 넘어간다.
+
+        실측: batch 4 / 800x1440 에서 950 스텝에 94.7GB 로 터졌다.
+        함수로 빼면 return 시점에 지역 변수가 전부 사라져 한 스텝분만 잡힌다.
+
+    Returns:
+        dict — 손실 값들. 공통 ID 가 부족해 건너뛰면 None.
+    """
+    img_t = batch['img_t'].to(device, non_blocking=True)
+    img_u = batch['img_u'].to(device, non_blocking=True)
+
+    student.train()
+    optimG.zero_grad(set_to_none=True)
+
+    # 1) teacher forward (clean path)
+    with torch.no_grad():
+        _, ft_t = teacher(img_t, feat=True)
+        _, ft_u = teacher(img_u, feat=True)
+
+    # 2) student forward (adversarial)
+    adv_t, fs_t = student(img_t, feat=True)
+    adv_u, fs_u = student(img_u, feat=True)
+
+    # 3) eps 예산 적용
+    adv_t = apply_perturbation(adv_t, img_t, eps, args.delta_param)
+    adv_u = apply_perturbation(adv_u, img_u, eps, args.delta_param)
+
+    # 4) SCGA 일관성 손실
+    gen_sim = (generator_consistency_loss(ft_t, fs_t)
+               + generator_consistency_loss(ft_u, fs_u))
+
+    # 5) 공격 손실
+    d_t, ids_t, box_t = frame_descriptor(detector, adv_t,
+                                         batch['boxes_t'].to(device),
+                                         batch['ids_t'].to(device), args)
+    d_u, ids_u, box_u = frame_descriptor(detector, adv_u,
+                                         batch['boxes_u'].to(device),
+                                         batch['ids_u'].to(device), args)
+
+    # 두 프레임에 공통 ID 가 없으면 공격 손실을 계산할 수 없다.
+    # (데이터셋에서 공통 ID 2개 이상인 쌍만 뽑았으므로 드물지만,
+    #  매칭 실패로 남지 않을 수 있다)
+    common = set(ids_t.tolist()) & set(ids_u.tolist())
+    if len(common) < 2:
+        return None
+
+    l_att, parts = attack_loss(d_t, d_u, ids_t, ids_u, lam=args.lam,
+                               center=not args.no_center)
+
+    # 6) 합산 + 갱신
+    loss = l_att + args.w_consistency * gen_sim
+    if args.w_iou > 0:
+        l_iou = temporal_iou_loss(box_t, box_u, ids_t, ids_u)
+        loss = loss + args.w_iou * l_iou
+        parts['iou'] = l_iou.item()
+
+    loss.backward()
+    optimG.step()
+    update_ema(student, teacher, momentum=args.ema_momentum)
+
+    parts['loss'] = loss.item()
+    parts['gen'] = gen_sim.item()
+    return parts
+
+
+# ══════════════════════════════════════════════════════════════════
+#  체크포인트
+# ══════════════════════════════════════════════════════════════════
+
+def save_ckpt(path, student, teacher, optimG, epoch, gstep, args):
+    """중단된 학습을 이어받을 수 있도록 전부 담는다."""
+    torch.save({'student': student.state_dict(),
+                'teacher': teacher.state_dict(),
+                'optim': optimG.state_dict(),
+                'epoch': epoch, 'gstep': gstep,
+                'args': vars(args)}, path)
+
+
 def main():
     args = get_parser().parse_args()
     torch.manual_seed(args.seed)
@@ -344,6 +445,19 @@ def main():
 
     optimG = optim.Adam(student.parameters(), lr=args.lr, betas=(0.5, 0.999))
 
+    # ── 이어받기 ────────────────────────────────────────────────
+    # 에폭 단위로만 이어받는다. DataLoader 의 셔플 상태까지 복원하지는 않으므로
+    # 에폭 중간에서 끊긴 경우 그 에폭은 처음부터 다시 돈다.
+    start_epoch, gstep = 0, 0
+    if args.resume:
+        ck = torch.load(args.resume, map_location=device)
+        student.load_state_dict(ck['student'])
+        teacher.load_state_dict(ck['teacher'])
+        optimG.load_state_dict(ck['optim'])
+        start_epoch, gstep = ck['epoch'] + 1, ck['gstep']
+        print(f'이어받기: {args.resume} | epoch {start_epoch} 부터, '
+              f'누적 {gstep} 스텝', flush=True)
+
     # ── 데이터 ──────────────────────────────────────────────────
     train_set = MOT17PairDataset(
         data_root=args.data_root,
@@ -369,75 +483,28 @@ def main():
     csv_file = open(csv_path, 'w', newline='')
     csv_w = csv.writer(csv_file)
     csv_w.writerow(['step', 'epoch', 'loss', 'decorr', 'confuse', 'iou',
-                    'gen', 'skip', 'elapsed_s'])
+                    'gen', 'skip', 'elapsed_s', 'vram_gb'])
     t_start = time.time()
-    gstep = 0
     total_steps = len(train_loader) * args.epochs
-    print(f'총 {total_steps} 스텝 | 로그 {csv_path}', flush=True)
+    print(f'총 {total_steps} 스텝 | 배치 {args.batch_size} | 로그 {csv_path}',
+          flush=True)
 
     # ── 학습 루프 (SCGA 그대로) ────────────────────────────────
     n_skip = 0
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{args.epochs}', ncols=90,
                     disable=not is_tty)
         for it, batch in enumerate(pbar):
-            img_t = batch['img_t'].to(device, non_blocking=True)
-            img_u = batch['img_u'].to(device, non_blocking=True)
-
-            student.train()
-            optimG.zero_grad()
-
-            # 1) teacher forward (clean path)
-            with torch.no_grad():
-                _, ft_t = teacher(img_t, feat=True)
-                _, ft_u = teacher(img_u, feat=True)
-
-            # 2) student forward (adversarial)
-            adv_t, fs_t = student(img_t, feat=True)
-            adv_u, fs_u = student(img_u, feat=True)
-
-            # 3) eps 예산 적용
-            adv_t = apply_perturbation(adv_t, img_t, eps, args.delta_param)
-            adv_u = apply_perturbation(adv_u, img_u, eps, args.delta_param)
-
-            # 4) SCGA 일관성 손실
-            gen_sim = (generator_consistency_loss(ft_t, fs_t)
-                       + generator_consistency_loss(ft_u, fs_u))
-
-            # 5) 공격 손실
-            d_t, ids_t, box_t = frame_descriptor(detector, adv_t,
-                                                 batch['boxes_t'].to(device),
-                                                 batch['ids_t'].to(device), args)
-            d_u, ids_u, box_u = frame_descriptor(detector, adv_u,
-                                                 batch['boxes_u'].to(device),
-                                                 batch['ids_u'].to(device), args)
-
-            # 두 프레임에 공통 ID 가 없으면 공격 손실을 계산할 수 없다.
-            # (데이터셋에서 공통 ID 2개 이상인 쌍만 뽑았으므로 드물지만,
-            #  매칭 실패로 남지 않을 수 있다)
-            common = set(ids_t.tolist()) & set(ids_u.tolist())
-            if len(common) < 2:
+            parts = train_step(batch, student, teacher, detector,
+                               optimG, args, eps, device)
+            if parts is None:
                 n_skip += 1
                 continue
 
-            l_att, parts = attack_loss(d_t, d_u, ids_t, ids_u, lam=args.lam,
-                                       center=not args.no_center)
-
-            # 6) 합산 + 갱신
-            loss = l_att + args.w_consistency * gen_sim
-            if args.w_iou > 0:
-                l_iou = temporal_iou_loss(box_t, box_u, ids_t, ids_u)
-                loss = loss + args.w_iou * l_iou
-                parts['iou'] = l_iou.item()
-
-            loss.backward()
-            optimG.step()
-            update_ema(student, teacher, momentum=args.ema_momentum)
-
-            post = dict(loss=f'{loss.item():.3f}',
+            post = dict(loss=f'{parts["loss"]:.3f}',
                         dec=f'{parts["decorr"]:.3f}',
                         con=f'{parts["confuse"]:.3f}',
-                        gen=f'{gen_sim.item():.3f}',
+                        gen=f'{parts["gen"]:.3f}',
                         skip=n_skip)
             if 'iou' in parts:
                 post['iou'] = f'{parts["iou"]:.3f}'
@@ -447,27 +514,37 @@ def main():
             gstep += 1
             if gstep % args.log_every == 0 or gstep == 1:
                 el = time.time() - t_start
-                csv_w.writerow([gstep, epoch + 1, round(loss.item(), 5),
+                peak = (torch.cuda.max_memory_allocated() / 1024**3
+                        if device.type == 'cuda' else 0.0)
+                csv_w.writerow([gstep, epoch + 1, round(parts['loss'], 5),
                                 round(parts['decorr'], 5),
                                 round(parts['confuse'], 5),
                                 round(parts.get('iou', float('nan')), 5),
-                                round(gen_sim.item(), 5), n_skip, round(el, 1)])
+                                round(parts['gen'], 5), n_skip,
+                                round(el, 1), round(peak, 2)])
                 csv_file.flush()
                 if not is_tty:
                     eta = el / gstep * (total_steps - gstep) / 60
                     line = (f'[{epoch+1}/{args.epochs}] {gstep}/{total_steps} '
-                            f'loss={loss.item():.4f} dec={parts["decorr"]:.4f} '
+                            f'loss={parts["loss"]:.4f} dec={parts["decorr"]:.4f} '
                             f'con={parts["confuse"]:.4f}')
                     if 'iou' in parts:
                         line += f' iou={parts["iou"]:.4f}'
-                    print(f'{line} gen={gen_sim.item():.4f} skip={n_skip} '
-                          f'| {el/60:.1f}분 경과, 남은 {eta:.0f}분', flush=True)
+                    print(f'{line} gen={parts["gen"]:.4f} skip={n_skip} '
+                          f'| VRAM {peak:.1f}GB | {el/60:.1f}분 경과, '
+                          f'남은 {eta:.0f}분', flush=True)
+                if device.type == 'cuda':
+                    torch.cuda.reset_peak_memory_stats()
 
             # 8) 저장 (SCGA 는 student 가 아니라 teacher 를 저장한다)
             if it > 0 and it % args.save_freq == 0:
                 torch.save(teacher.state_dict(),
                            os.path.join(args.output_dir,
                                         f'teacher_{args.method}_{epoch}.pth'))
+
+        # 에폭 끝 — 중단되어도 이어받을 수 있게 전체 상태를 남긴다
+        save_ckpt(os.path.join(args.output_dir, 'ckpt_last.pth'),
+                  student, teacher, optimG, epoch, gstep, args)
 
     csv_file.close()
     torch.save(teacher.state_dict(),
