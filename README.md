@@ -52,6 +52,7 @@ mot-scga-attack/
     ├── compat.py             numpy 2.x 호환 계층
     ├── train_generator.py    학습
     ├── evaluate.py           공격 효과 평가 (MOTA/IDF1/IDSW)
+    ├── diagnose.py           실패 원인 진단 (노이즈·검출분포·서술자)
     ├── smoke_test.py         단위 테스트
     ├── e2e_test.py           end-to-end 1스텝 검증
     └── viz_dataset.py        데이터로더 시각 검증
@@ -189,15 +190,41 @@ PYTHONPATH=. python attack/evaluate.py --seqs MOT17-02-FRCNN \
 
 ---
 
+## 진단
+
+평가 지표가 예상과 다르게 나왔을 때, 학습을 다시 돌리기 전에 원인을 좁힌다.
+같은 프레임을 클린/공격 두 경로로 돌려 네 가지를 한 번에 본다.
+
+```bash
+PYTHONPATH=. python attack/diagnose.py \
+    --attack_ckpt experiments/<폴더>/teacher_ptca_final.pth
+```
+
+| 항목 | 무엇을 가르는가 |
+|---|---|
+| 노이즈 통계 | **구조/상수 비**가 1 미만이면 공격이 아니라 전역 톤 이동을 배운 것 |
+| 이미지 덤프 | `output/diagnose/<폴더>/` 에 클린·공격·δ 증폭 3장 |
+| 검출 분포 | BYTE 1차(≥`track_thresh`)·2차(0.1~thr) 구간별 개수. **low 만 줄면 공격이 트래커를 청소해 준 것** |
+| 서술자 코사인 | 평가 구간에서 같은-ID 코사인이 안 변하면 학습 실패, 내려갔는데 IDF1이 멀쩡하면 손실-실효 불일치 |
+
+마지막에 판정 문구가 출력된다. 서술자·공격 인자는 **학습 때와 같은 값**을 줘야 한다.
+
+---
+
 ## 현재 상태
 
 | 항목 | 상태 |
 |---|---|
 | 단위 테스트 / e2e | 통과 (CPU) |
 | 데이터로더 시각 검증 | 통과 |
-| 클린 기준값 (MOT17-02-FRCNN, val 절반, 800x1440, YOLOX-S) | MOTA 55.1 / IDF1 53.1 / IDSW 66 |
 | 랜덤 노이즈 baseline | IDF1 변화 없음 — 학습된 공격이 넘어야 할 하한선 |
-| GPU 학습 | 미실행 |
+| GPU 학습 (1 epoch) | 완료 — 30분 / 1,983 스텝 |
+| Exp-001 클린 (MOT17-02-FRCNN, val 절반, 800x1440, YOLOX-S) | MOTA 54.9 / IDF1 52.7 / IDSW 68 |
+| Exp-001 공격 | MOTA 55.4 / **IDF1 60.9** / IDSW 48 |
+
+Exp-001 은 **공격이 추적을 오히려 개선했다**(IDF1 +8.2, IDSW -20).
+Precision 은 오르고 Recall 만 떨어진 패턴이라, 노이즈가 저신뢰 검출을 지워
+ByteTrack 의 2차 매칭을 정리해 준 것으로 의심된다. 원인 확인은 위 **진단** 절차로 한다.
 
 ---
 
