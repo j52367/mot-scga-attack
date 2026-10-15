@@ -163,3 +163,9 @@ videos/*.mp4
 
 # 설계·구현 문서 (로컬 및 OneDrive 백업에만 보관)
 docs/
+
+# README 그림은 공개 (docs 본문은 비공개)
+!docs_assets/
+docs_assets/*
+!docs_assets/*.jpg
+!docs_assets/*.png
